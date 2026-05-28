@@ -6,6 +6,30 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config OPENAI_API_KEY
+    string "OpenAI API key"
+    default ""
+    help
+        API key used by the GPT Realtime provider. Leave empty and provision the key in NVS under openai/api_key.
+
+config OPENAI_REALTIME_MODEL
+    string "OpenAI Realtime model"
+    default "gpt-realtime"
+    help
+        Realtime model used by the GPT provider.
+
+config OPENAI_REALTIME_VOICE
+    string "OpenAI Realtime voice"
+    default "alloy"
+    help
+        Voice used for GPT Realtime audio output.
+
+config OPENAI_REALTIME_INSTRUCTIONS
+    string "OpenAI Realtime instructions"
+    default "You are Stack-chan, a compact desktop robot. Reply briefly and naturally."
+    help
+        Default instructions sent to the GPT Realtime session.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

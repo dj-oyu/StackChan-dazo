@@ -43,7 +43,7 @@ extern "C" void app_main(void)
 
         GetMooncake().update();
 
-        if (GetHAL().isXiaozhiStartRequested()) {
+        if (GetHAL().isAgentRuntimeStartRequested()) {
             break;
         }
     }
@@ -52,6 +52,6 @@ extern "C" void app_main(void)
     GetMooncake().uninstallAllApps();
     DestroyMooncake();
 
-    // Start xiaozhi, never returns
-    GetHAL().startXiaozhi();
+    // Start selected agent runtime, never returns
+    GetHAL().startRequestedAgentRuntime();
 }

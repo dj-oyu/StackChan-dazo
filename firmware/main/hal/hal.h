@@ -124,6 +124,16 @@ struct XiaozhiConfig_t {
  * @brief
  *
  */
+enum class AgentRuntimeKind {
+    None = 0,
+    Xiaozhi,
+    Gpt,
+};
+
+/**
+ * @brief
+ *
+ */
 enum class MicTestStatus {
     Starting = 0,
     Recording,
@@ -201,15 +211,23 @@ public:
     void setBackLightBrightness(uint8_t brightness, bool permanent = false);
     uint8_t getBackLightBrightness();
 
-    /* --------------------------------- Xiaozhi -------------------------------- */
+    /* ------------------------------- AI Runtime ------------------------------- */
+    void requestAgentRuntimeStart(AgentRuntimeKind kind)
+    {
+        _agent_runtime_start_requested = true;
+        _requested_agent_runtime       = kind;
+    }
     void requestXiaozhiStart()
     {
-        _xiaozhi_start_requested = true;
+        requestAgentRuntimeStart(AgentRuntimeKind::Xiaozhi);
     }
+    bool isAgentRuntimeStartRequested() { return _agent_runtime_start_requested; }
+    AgentRuntimeKind getRequestedAgentRuntime() { return _requested_agent_runtime; }
     bool isXiaozhiStartRequested()
     {
-        return _xiaozhi_start_requested;
+        return _agent_runtime_start_requested && _requested_agent_runtime == AgentRuntimeKind::Xiaozhi;
     }
+    void startRequestedAgentRuntime();
     void startXiaozhi();
     XiaozhiConfig_t getXiaozhiConfig();
     void setXiaozhiConfig(XiaozhiConfig_t config);
@@ -301,7 +319,8 @@ public:
     void clearupMicTest();
 
 private:
-    bool _xiaozhi_start_requested = false;
+    bool _agent_runtime_start_requested       = false;
+    AgentRuntimeKind _requested_agent_runtime = AgentRuntimeKind::None;
 
     void xiaozhi_board_init();
     void lvgl_init();

@@ -5,6 +5,7 @@
  */
 #include "app_ai_agent.h"
 #include <hal/hal.h>
+#include <settings.h>
 #include <mooncake.h>
 #include <mooncake_log.h>
 #include <assets/assets.h>
@@ -39,9 +40,12 @@ void AppAiAgent::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
 
-    // Request to start Xiaozhi service
+    Settings settings("agent", false);
+    auto provider = settings.GetString("provider", "gpt");
+
+    // Request to start the selected agent runtime.
     // All apps will be uninstall in next mooncake update
-    GetHAL().requestXiaozhiStart();
+    GetHAL().requestAgentRuntimeStart(provider == "xiaozhi" ? AgentRuntimeKind::Xiaozhi : AgentRuntimeKind::Gpt);
 }
 
 // Called repeatedly while the App is running

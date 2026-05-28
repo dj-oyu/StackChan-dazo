@@ -6,6 +6,7 @@
 #include "workers.h"
 #include <mooncake_log.h>
 #include <hal/hal.h>
+#include <settings.h>
 #include <array>
 #include <vector>
 
@@ -101,7 +102,9 @@ XiaozhiPowerSavingWorker::XiaozhiPowerSavingWorker()
     _switch_charging->setSize(64, 36);
     _switch_charging->align(LV_ALIGN_TOP_MID, 0, 66);
     _switch_charging->setBgColor(lv_color_hex(0xB8D3FD), LV_PART_MAIN);
-    _switch_charging->setBgColor(lv_color_hex(0x615B9E), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    _switch_charging->setBgColor(lv_color_hex(0x615B9E),
+                                 static_cast<lv_style_selector_t>(LV_PART_INDICATOR) |
+                                     static_cast<lv_style_selector_t>(LV_STATE_CHECKED));
     _switch_charging->setBgColor(lv_color_hex(0xFFFFFF), LV_PART_KNOB);
     if (_config.allowShutdownWhenCharging) {
         _switch_charging->addState(LV_STATE_CHECKED);
@@ -237,4 +240,68 @@ void XiaozhiGeneralWorker::update()
 void XiaozhiGeneralWorker::update_idle_motion_label()
 {
     _label_idle_motion_value->setText(_idle_motion_level_labels[_config.idleRandomMovementLevel]);
+}
+
+AgentProviderWorker::AgentProviderWorker()
+{
+    mclog::info("AgentProviderWorker start");
+
+    Settings settings("agent", false);
+    auto provider = settings.GetString("provider", "gpt");
+
+    _panel = std::make_unique<Container>(lv_screen_active());
+    _panel->setBgColor(lv_color_hex(0xEDF4FF));
+    _panel->align(LV_ALIGN_CENTER, 0, 0);
+    _panel->setBorderWidth(0);
+    _panel->setSize(320, 240);
+    _panel->setRadius(0);
+    _panel->setPadding(0, 50, 24, 18);
+    _panel->setScrollDir(LV_DIR_VER);
+    _panel->setScrollbarMode(LV_SCROLLBAR_MODE_ACTIVE);
+
+    _panel_provider = std::make_unique<Container>(_panel->get());
+    _panel_provider->setSize(296, 156);
+    _panel_provider->align(LV_ALIGN_TOP_MID, 0, 20);
+    _panel_provider->setBgColor(lv_color_hex(0xD2E3FF));
+    _panel_provider->setBorderWidth(0);
+    _panel_provider->setRadius(18);
+    _panel_provider->setPadding(0, 0, 0, 0);
+    _panel_provider->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
+
+    _label_title = std::make_unique<Label>(_panel_provider->get());
+    _label_title->setText("AI provider:");
+    _label_title->setTextFont(&lv_font_montserrat_16);
+    _label_title->setTextColor(lv_color_hex(0x26206A));
+    _label_title->setWidth(260);
+    _label_title->setTextAlign(LV_TEXT_ALIGN_CENTER);
+    _label_title->align(LV_ALIGN_TOP_MID, 0, 18);
+
+    _roller = std::make_unique<Roller>(_panel_provider->get());
+    _roller->setOptions("GPT\nXiaozhi");
+    _roller->setVisibleRowCount(2);
+    _roller->setWidth(180);
+    _roller->align(LV_ALIGN_TOP_MID, 0, 58);
+    _roller->setSelected(provider == "xiaozhi" ? 1 : 0, LV_ANIM_OFF);
+
+    _btn_confirm = std::make_unique<Button>(_panel->get());
+    apply_button_common_style(*_btn_confirm);
+    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 196);
+    _btn_confirm->setSize(290, 50);
+    _btn_confirm->label().setText("Confirm");
+    _btn_confirm->onClick().connect([this]() { _confirm_flag = true; });
+}
+
+void AgentProviderWorker::update()
+{
+    if (!_confirm_flag) {
+        return;
+    }
+
+    _confirm_flag = false;
+    Settings settings("agent", true);
+    auto provider = _roller->getSelected() == 1 ? "xiaozhi" : "gpt";
+    settings.SetString("provider", provider);
+    settings.SetString("session_provider", provider);
+    mclog::tagInfo(_tag, "agent provider updated: {}", provider);
+    _is_done = true;
 }
