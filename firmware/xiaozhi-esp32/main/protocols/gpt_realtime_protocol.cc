@@ -1,0 +1,541 @@
+#include "gpt_realtime_protocol.h"
+
+#include "audio_service.h"
+#include "board.h"
+#include "settings.h"
+#include "system_info.h"
+#include "assets/lang_config.h"
+
+#include <algorithm>
+#include <cstring>
+#include <cJSON.h>
+#include <esp_log.h>
+#include <mbedtls/base64.h>
+#include <web_socket.h>
+
+#define TAG "GPT"
+
+#define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
+    (esp_ae_rate_cvt_cfg_t)                                  \
+    {                                                        \
+        .src_rate        = (uint32_t)(_src_rate),            \
+        .dest_rate       = (uint32_t)(_dest_rate),           \
+        .channel         = (uint8_t)(_channel),              \
+        .bits_per_sample = ESP_AUDIO_BIT16,                  \
+        .complexity      = 2,                                \
+        .perf_type       = ESP_AE_RATE_CVT_PERF_TYPE_SPEED,  \
+    }
+
+#define OPUS_DEC_CFG(_sample_rate, _frame_duration_ms)                                                    \
+    (esp_opus_dec_cfg_t)                                                                                  \
+    {                                                                                                     \
+        .sample_rate    = (uint32_t)(_sample_rate),                                                       \
+        .channel        = ESP_AUDIO_MONO,                                                                 \
+        .frame_duration = (esp_opus_dec_frame_duration_t)AS_OPUS_GET_FRAME_DRU_ENUM(_frame_duration_ms),  \
+        .self_delimited = false,                                                                          \
+    }
+
+#define OPUS_ENC_CFG(_sample_rate, _frame_duration_ms)                                                    \
+    (esp_opus_enc_config_t)                                                                               \
+    {                                                                                                     \
+        .sample_rate      = (int)(_sample_rate),                                                          \
+        .channel          = ESP_AUDIO_MONO,                                                               \
+        .bits_per_sample  = ESP_AUDIO_BIT16,                                                             \
+        .bitrate          = ESP_OPUS_BITRATE_AUTO,                                                        \
+        .frame_duration   = (esp_opus_enc_frame_duration_t)AS_OPUS_GET_FRAME_DRU_ENUM(_frame_duration_ms),\
+        .application_mode = ESP_OPUS_ENC_APPLICATION_AUDIO,                                               \
+        .complexity       = 0,                                                                            \
+        .enable_fec       = false,                                                                        \
+        .enable_dtx       = false,                                                                        \
+        .enable_vbr       = true,                                                                         \
+    }
+
+GptRealtimeProtocol::GptRealtimeProtocol()
+{
+    event_group_handle_ = xEventGroupCreate();
+    server_sample_rate_ = kOutputSampleRate;
+    server_frame_duration_ = kFrameDurationMs;
+}
+
+GptRealtimeProtocol::~GptRealtimeProtocol()
+{
+    CloseAudioChannel(false);
+    if (input_opus_decoder_ != nullptr) {
+        esp_opus_dec_close(input_opus_decoder_);
+    }
+    if (output_opus_encoder_ != nullptr) {
+        esp_opus_enc_close(output_opus_encoder_);
+    }
+    if (input_resampler_ != nullptr) {
+        esp_ae_rate_cvt_close(input_resampler_);
+    }
+    if (event_group_handle_ != nullptr) {
+        vEventGroupDelete(event_group_handle_);
+    }
+}
+
+bool GptRealtimeProtocol::Start()
+{
+    return true;
+}
+
+void GptRealtimeProtocol::LoadSettings()
+{
+    Settings settings("openai", false);
+    api_key_ = settings.GetString("api_key", CONFIG_OPENAI_API_KEY);
+    model_ = settings.GetString("model", CONFIG_OPENAI_REALTIME_MODEL);
+    voice_ = settings.GetString("voice", CONFIG_OPENAI_REALTIME_VOICE);
+    instructions_ = settings.GetString("instructions", CONFIG_OPENAI_REALTIME_INSTRUCTIONS);
+    url_ = settings.GetString("url", "");
+    if (url_.empty()) {
+        url_ = "wss://api.openai.com/v1/realtime?model=" + model_;
+    }
+}
+
+bool GptRealtimeProtocol::EnsureCodecs()
+{
+    std::lock_guard<std::mutex> lock(codec_mutex_);
+
+    if (input_opus_decoder_ == nullptr) {
+        auto dec_cfg = OPUS_DEC_CFG(16000, OPUS_FRAME_DURATION_MS);
+        auto ret = esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &input_opus_decoder_);
+        if (ret != ESP_AUDIO_ERR_OK || input_opus_decoder_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to open input opus decoder: %d", ret);
+            return false;
+        }
+    }
+
+    if (output_opus_encoder_ == nullptr) {
+        auto enc_cfg = OPUS_ENC_CFG(kOutputSampleRate, kFrameDurationMs);
+        auto ret = esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &output_opus_encoder_);
+        if (ret != ESP_AUDIO_ERR_OK || output_opus_encoder_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to open output opus encoder: %d", ret);
+            return false;
+        }
+    }
+
+    if (input_resampler_ == nullptr) {
+        auto resampler_cfg = RATE_CVT_CFG(16000, kInputSampleRate, ESP_AUDIO_MONO);
+        auto ret = esp_ae_rate_cvt_open(&resampler_cfg, (esp_ae_rate_cvt_handle_t*)&input_resampler_);
+        if (ret != ESP_AE_ERR_OK || input_resampler_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to open input resampler: %d", ret);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool GptRealtimeProtocol::OpenAudioChannel()
+{
+    LoadSettings();
+    if (api_key_.empty()) {
+        SetError("OpenAI API key is not configured");
+        return false;
+    }
+    if (!EnsureCodecs()) {
+        SetError(Lang::Strings::SERVER_ERROR);
+        return false;
+    }
+
+    error_occurred_ = false;
+    audio_channel_opened_ = false;
+    response_audio_started_ = false;
+    input_audio_appended_ = false;
+    output_pcm_buffer_.clear();
+    xEventGroupClearBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
+
+    auto network = Board::GetInstance().GetNetwork();
+    websocket_ = network->CreateWebSocket(1);
+    if (websocket_ == nullptr) {
+        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        return false;
+    }
+
+    std::string bearer = "Bearer " + api_key_;
+    websocket_->SetHeader("Authorization", bearer.c_str());
+    websocket_->SetHeader("OpenAI-Beta", "realtime=v1");
+    websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+    websocket_->SetReceiveBufferSize(16384);
+    websocket_->OnData([this](const char* data, size_t len, bool binary) {
+        if (!binary) {
+            HandleTextMessage(data, len);
+        }
+        last_incoming_time_ = std::chrono::steady_clock::now();
+    });
+    websocket_->OnDisconnected([this]() {
+        ESP_LOGI(TAG, "Realtime websocket disconnected");
+        audio_channel_opened_ = false;
+        if (on_audio_channel_closed_ != nullptr) {
+            on_audio_channel_closed_();
+        }
+    });
+
+    ESP_LOGI(TAG, "Connecting to OpenAI Realtime: %s", url_.c_str());
+    if (!websocket_->Connect(url_.c_str())) {
+        ESP_LOGE(TAG, "Failed to connect OpenAI Realtime, code=%d", websocket_->GetLastError());
+        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        return false;
+    }
+
+    if (!SendSessionUpdate()) {
+        return false;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT, pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS(10000));
+    if (!(bits & GPT_REALTIME_SESSION_READY_EVENT)) {
+        SetError(Lang::Strings::SERVER_TIMEOUT);
+        return false;
+    }
+
+    audio_channel_opened_ = true;
+    if (on_audio_channel_opened_ != nullptr) {
+        on_audio_channel_opened_();
+    }
+    if (on_connected_ != nullptr) {
+        on_connected_();
+    }
+    return true;
+}
+
+void GptRealtimeProtocol::CloseAudioChannel(bool send_goodbye)
+{
+    (void)send_goodbye;
+    audio_channel_opened_ = false;
+    websocket_.reset();
+}
+
+bool GptRealtimeProtocol::IsAudioChannelOpened() const
+{
+    return websocket_ != nullptr && websocket_->IsConnected() && audio_channel_opened_ && !error_occurred_ && !IsTimeout();
+}
+
+bool GptRealtimeProtocol::SendText(const std::string& text)
+{
+    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+        return false;
+    }
+    if (!websocket_->Send(text)) {
+        SetError(Lang::Strings::SERVER_ERROR);
+        return false;
+    }
+    return true;
+}
+
+bool GptRealtimeProtocol::SendSessionUpdate()
+{
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "session.update");
+
+    cJSON* session = cJSON_AddObjectToObject(root, "session");
+    cJSON_AddStringToObject(session, "type", "realtime");
+    cJSON_AddStringToObject(session, "model", model_.c_str());
+    cJSON_AddStringToObject(session, "instructions", instructions_.c_str());
+
+    cJSON* output_modalities = cJSON_AddArrayToObject(session, "output_modalities");
+    cJSON_AddItemToArray(output_modalities, cJSON_CreateString("audio"));
+    cJSON_AddItemToArray(output_modalities, cJSON_CreateString("text"));
+
+    cJSON* audio = cJSON_AddObjectToObject(session, "audio");
+    cJSON* input = cJSON_AddObjectToObject(audio, "input");
+    cJSON* input_format = cJSON_AddObjectToObject(input, "format");
+    cJSON_AddStringToObject(input_format, "type", "audio/pcm");
+    cJSON_AddNumberToObject(input_format, "rate", kInputSampleRate);
+    cJSON_AddNullToObject(input, "turn_detection");
+
+    cJSON* output = cJSON_AddObjectToObject(audio, "output");
+    cJSON* output_format = cJSON_AddObjectToObject(output, "format");
+    cJSON_AddStringToObject(output_format, "type", "audio/pcm");
+    cJSON_AddStringToObject(output, "voice", voice_.c_str());
+
+    char* json = cJSON_PrintUnformatted(root);
+    std::string message(json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return SendText(message);
+}
+
+bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
+{
+    if (!IsAudioChannelOpened() || packet == nullptr) {
+        return false;
+    }
+
+    std::vector<int16_t> pcm;
+    if (!DecodeInputOpus(*packet, pcm)) {
+        return false;
+    }
+    if (!ResampleInputPcm(pcm, packet->sample_rate)) {
+        return false;
+    }
+
+    auto encoded = Base64Encode(reinterpret_cast<const uint8_t*>(pcm.data()), pcm.size() * sizeof(int16_t));
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
+    cJSON_AddStringToObject(root, "audio", encoded.c_str());
+    char* json = cJSON_PrintUnformatted(root);
+    std::string message(json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+
+    input_audio_appended_ = true;
+    return SendText(message);
+}
+
+void GptRealtimeProtocol::SendStartListening(ListeningMode mode)
+{
+    (void)mode;
+    input_audio_appended_ = false;
+    response_audio_started_ = false;
+    output_pcm_buffer_.clear();
+    SendText("{\"type\":\"input_audio_buffer.clear\"}");
+}
+
+void GptRealtimeProtocol::SendStopListening()
+{
+    if (!input_audio_appended_) {
+        return;
+    }
+    SendText("{\"type\":\"input_audio_buffer.commit\"}");
+    SendText("{\"type\":\"response.create\"}");
+    input_audio_appended_ = false;
+}
+
+void GptRealtimeProtocol::SendAbortSpeaking(AbortReason reason)
+{
+    (void)reason;
+    SendText("{\"type\":\"response.cancel\"}");
+    EmitTtsState("stop");
+}
+
+void GptRealtimeProtocol::SendWakeWordDetected(const std::string& wake_word)
+{
+    (void)wake_word;
+}
+
+void GptRealtimeProtocol::SendMcpMessage(const std::string& message)
+{
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "conversation.item.create");
+    cJSON* item = cJSON_AddObjectToObject(root, "item");
+    cJSON_AddStringToObject(item, "type", "message");
+    cJSON_AddStringToObject(item, "role", "user");
+    cJSON* content = cJSON_AddArrayToObject(item, "content");
+    cJSON* part = cJSON_CreateObject();
+    cJSON_AddStringToObject(part, "type", "input_text");
+    cJSON_AddStringToObject(part, "text", message.c_str());
+    cJSON_AddItemToArray(content, part);
+    char* json = cJSON_PrintUnformatted(root);
+    SendText(json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    SendText("{\"type\":\"response.create\"}");
+}
+
+void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
+{
+    std::string message(data, len);
+    cJSON* root = cJSON_Parse(message.c_str());
+    if (root == nullptr) {
+        ESP_LOGW(TAG, "Failed to parse realtime event");
+        return;
+    }
+
+    auto type = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(type)) {
+        if (strcmp(type->valuestring, "session.created") == 0 || strcmp(type->valuestring, "session.updated") == 0) {
+            xEventGroupSetBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
+        } else if (strcmp(type->valuestring, "response.output_audio.delta") == 0 ||
+                   strcmp(type->valuestring, "response.audio.delta") == 0) {
+            HandleAudioDelta(root);
+        } else if (strcmp(type->valuestring, "response.output_audio.done") == 0 ||
+                   strcmp(type->valuestring, "response.audio.done") == 0 ||
+                   strcmp(type->valuestring, "response.done") == 0) {
+            EmitTtsState("stop");
+            response_audio_started_ = false;
+            output_pcm_buffer_.clear();
+        } else if (strcmp(type->valuestring, "response.output_audio_transcript.delta") == 0 ||
+                   strcmp(type->valuestring, "response.audio_transcript.delta") == 0 ||
+                   strcmp(type->valuestring, "response.output_text.delta") == 0) {
+            HandleTranscriptDelta(root);
+        } else if (strcmp(type->valuestring, "error") == 0) {
+            auto error = cJSON_GetObjectItem(root, "error");
+            auto msg = cJSON_GetObjectItem(error, "message");
+            SetError(cJSON_IsString(msg) ? msg->valuestring : Lang::Strings::SERVER_ERROR);
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+void GptRealtimeProtocol::HandleAudioDelta(const cJSON* root)
+{
+    auto delta = cJSON_GetObjectItem(root, "delta");
+    if (!cJSON_IsString(delta)) {
+        return;
+    }
+
+    auto bytes = Base64Decode(delta->valuestring);
+    if (bytes.empty()) {
+        return;
+    }
+
+    if (!response_audio_started_) {
+        response_audio_started_ = true;
+        EmitTtsState("start");
+    }
+
+    output_pcm_buffer_.insert(output_pcm_buffer_.end(), bytes.begin(), bytes.end());
+    const size_t frame_bytes = kOutputSampleRate * kFrameDurationMs / 1000 * sizeof(int16_t);
+    while (output_pcm_buffer_.size() >= frame_bytes) {
+        auto* samples = reinterpret_cast<const int16_t*>(output_pcm_buffer_.data());
+        if (!EncodeAndEmitOutputPcm(samples, frame_bytes / sizeof(int16_t))) {
+            break;
+        }
+        output_pcm_buffer_.erase(output_pcm_buffer_.begin(), output_pcm_buffer_.begin() + frame_bytes);
+    }
+}
+
+void GptRealtimeProtocol::HandleTranscriptDelta(const cJSON* root)
+{
+    auto delta = cJSON_GetObjectItem(root, "delta");
+    if (!cJSON_IsString(delta) || delta->valuestring[0] == '\0') {
+        return;
+    }
+    EmitTtsState("sentence_start", delta->valuestring);
+}
+
+void GptRealtimeProtocol::EmitTtsState(const char* state, const char* text)
+{
+    if (on_incoming_json_ == nullptr) {
+        return;
+    }
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "tts");
+    cJSON_AddStringToObject(root, "state", state);
+    if (text != nullptr) {
+        cJSON_AddStringToObject(root, "text", text);
+    }
+    on_incoming_json_(root);
+    cJSON_Delete(root);
+}
+
+bool GptRealtimeProtocol::DecodeInputOpus(const AudioStreamPacket& packet, std::vector<int16_t>& pcm)
+{
+    std::lock_guard<std::mutex> lock(codec_mutex_);
+    int sample_rate = packet.sample_rate == 0 ? 16000 : packet.sample_rate;
+    int frame_duration = packet.frame_duration == 0 ? OPUS_FRAME_DURATION_MS : packet.frame_duration;
+    size_t samples = sample_rate / 1000 * frame_duration;
+    pcm.resize(samples);
+
+    esp_audio_dec_in_raw_t raw = {
+        .buffer = const_cast<uint8_t*>(packet.payload.data()),
+        .len = (uint32_t)packet.payload.size(),
+        .consumed = 0,
+        .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+    };
+    esp_audio_dec_out_frame_t out = {
+        .buffer = reinterpret_cast<uint8_t*>(pcm.data()),
+        .len = (uint32_t)(pcm.size() * sizeof(int16_t)),
+        .decoded_size = 0,
+    };
+    esp_audio_dec_info_t info = {};
+    auto ret = esp_opus_dec_decode(input_opus_decoder_, &raw, &out, &info);
+    if (ret != ESP_AUDIO_ERR_OK) {
+        ESP_LOGE(TAG, "Failed to decode input opus: %d", ret);
+        return false;
+    }
+    pcm.resize(out.decoded_size / sizeof(int16_t));
+    return true;
+}
+
+bool GptRealtimeProtocol::ResampleInputPcm(std::vector<int16_t>& pcm, int from_sample_rate)
+{
+    if (from_sample_rate == 0 || from_sample_rate == kInputSampleRate) {
+        return true;
+    }
+    if (from_sample_rate != 16000) {
+        ESP_LOGW(TAG, "Unsupported input sample rate for GPT resampler: %d", from_sample_rate);
+        return false;
+    }
+
+    uint32_t max_output_samples = 0;
+    esp_ae_rate_cvt_get_max_out_sample_num((esp_ae_rate_cvt_handle_t)input_resampler_, pcm.size(), &max_output_samples);
+    std::vector<int16_t> resampled(max_output_samples);
+    uint32_t actual_output_samples = max_output_samples;
+    auto ret = esp_ae_rate_cvt_process((esp_ae_rate_cvt_handle_t)input_resampler_, (esp_ae_sample_t)pcm.data(),
+                                       pcm.size(), (esp_ae_sample_t)resampled.data(), &actual_output_samples);
+    if (ret != ESP_AE_ERR_OK) {
+        ESP_LOGE(TAG, "Failed to resample input pcm: %d", ret);
+        return false;
+    }
+    resampled.resize(actual_output_samples);
+    pcm = std::move(resampled);
+    return true;
+}
+
+bool GptRealtimeProtocol::EncodeAndEmitOutputPcm(const int16_t* samples, size_t sample_count)
+{
+    std::lock_guard<std::mutex> lock(codec_mutex_);
+    int input_bytes = 0;
+    int output_bytes = 0;
+    esp_opus_enc_get_frame_size(output_opus_encoder_, &input_bytes, &output_bytes);
+    if (input_bytes != static_cast<int>(sample_count * sizeof(int16_t))) {
+        ESP_LOGW(TAG, "Unexpected GPT output frame size: got=%u expected=%d", sample_count * sizeof(int16_t), input_bytes);
+    }
+
+    std::vector<uint8_t> encoded(output_bytes);
+    esp_audio_enc_in_frame_t in = {
+        .buffer = (uint8_t*)samples,
+        .len = (uint32_t)(sample_count * sizeof(int16_t)),
+    };
+    esp_audio_enc_out_frame_t out = {
+        .buffer = encoded.data(),
+        .len = (uint32_t)encoded.size(),
+        .encoded_bytes = 0,
+    };
+    auto ret = esp_opus_enc_process(output_opus_encoder_, &in, &out);
+    if (ret != ESP_AUDIO_ERR_OK) {
+        ESP_LOGE(TAG, "Failed to encode GPT output opus: %d", ret);
+        return false;
+    }
+
+    encoded.resize(out.encoded_bytes);
+    if (on_incoming_audio_ != nullptr) {
+        on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+            .sample_rate = kOutputSampleRate,
+            .frame_duration = kFrameDurationMs,
+            .timestamp = 0,
+            .payload = std::move(encoded),
+        }));
+    }
+    return true;
+}
+
+std::string GptRealtimeProtocol::Base64Encode(const uint8_t* data, size_t len)
+{
+    size_t output_len = 0;
+    mbedtls_base64_encode(nullptr, 0, &output_len, data, len);
+    std::string output(output_len, '\0');
+    if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(output.data()), output.size(), &output_len, data, len) != 0) {
+        return {};
+    }
+    output.resize(output_len);
+    return output;
+}
+
+std::vector<uint8_t> GptRealtimeProtocol::Base64Decode(const char* data)
+{
+    size_t input_len = strlen(data);
+    size_t output_len = 0;
+    mbedtls_base64_decode(nullptr, 0, &output_len, reinterpret_cast<const unsigned char*>(data), input_len);
+    std::vector<uint8_t> output(output_len);
+    if (mbedtls_base64_decode(output.data(), output.size(), &output_len, reinterpret_cast<const unsigned char*>(data), input_len) != 0) {
+        return {};
+    }
+    output.resize(output_len);
+    return output;
+}

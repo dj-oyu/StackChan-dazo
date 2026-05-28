@@ -37,7 +37,9 @@
 # Build files
 build/
 cmake-build-*/
-/components/
+components/*
+!components/esp-now/
+!components/esp-now/**
 managed_components/
 
 # PlatformIO
@@ -64,4 +66,5 @@ obj/
 sdkconfig
 sdkconfig.old
 
-xiaozhi-esp32/
+!xiaozhi-esp32/
+!xiaozhi-esp32/**
