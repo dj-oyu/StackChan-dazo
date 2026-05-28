@@ -2,6 +2,10 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
+if(WIN32)
+    set(CMAKE_NINJA_FORCE_RESPONSE_FILE ON CACHE BOOL "Use response files for Ninja commands" FORCE)
+endif()
+
 set(PROJECT_VER "1.4.1")
 add_definitions(-DFIRMWARE_VERSION=\"${PROJECT_VER}\")
 

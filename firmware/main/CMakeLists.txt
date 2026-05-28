@@ -2,12 +2,18 @@
 set(XIAOZHI_MAIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xiaozhi-esp32/main")
 
 file(GLOB_RECURSE STACK_CHAN_SOURCES
+    "agent_runtime/*.c"
+    "agent_runtime/*.cc"
+    "agent_runtime/*.cpp"
     "apps/*.c"
     "apps/*.cc"
     "apps/*.cpp"
     "assets/*.c"
     "assets/*.cc"
     "assets/*.cpp"
+    "compat/*.c"
+    "compat/*.cc"
+    "compat/*.cpp"
     "hal/*.c"
     "hal/*.cc"
     "hal/*.cpp"
@@ -51,6 +57,7 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "protocols/gpt_realtime_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -297,6 +304,9 @@ idf_component_register(SRCS ${SOURCES}
                         esp_pm
                         esp_psram
                         esp_netif
+                        esp_http_client
+                        esp_https_ota
+                        mbedtls
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
