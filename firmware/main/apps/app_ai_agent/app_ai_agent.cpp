@@ -45,7 +45,13 @@ void AppAiAgent::onOpen()
 
     // Request to start the selected agent runtime.
     // All apps will be uninstall in next mooncake update
-    GetHAL().requestAgentRuntimeStart(provider == "xiaozhi" ? AgentRuntimeKind::Xiaozhi : AgentRuntimeKind::Gpt);
+    AgentRuntimeKind kind = AgentRuntimeKind::Gpt;
+    if (provider == "xiaozhi") {
+        kind = AgentRuntimeKind::Xiaozhi;
+    } else if (provider == "grok") {
+        kind = AgentRuntimeKind::Grok;
+    }
+    GetHAL().requestAgentRuntimeStart(kind);
 }
 
 // Called repeatedly while the App is running

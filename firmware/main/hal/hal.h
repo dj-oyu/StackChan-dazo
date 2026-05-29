@@ -128,6 +128,7 @@ enum class AgentRuntimeKind {
     None = 0,
     Xiaozhi,
     Gpt,
+    Grok,
 };
 
 /**

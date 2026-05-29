@@ -132,6 +132,7 @@ void Hal::updateHeapStatusLog()
 /* -------------------------------------------------------------------------- */
 #include "board/hal_bridge.h"
 #include <agent_runtime/gpt_agent_runtime.h>
+#include <agent_runtime/grok_agent_runtime.h>
 #include <agent_runtime/xiaozhi_agent_runtime.h>
 #include <stackchan/stackchan.h>
 #include <apps/common/common.h>
@@ -209,6 +210,11 @@ void Hal::startRequestedAgentRuntime()
     switch (_requested_agent_runtime) {
         case AgentRuntimeKind::Gpt: {
             GptAgentRuntime runtime;
+            runtime.start();
+            break;
+        }
+        case AgentRuntimeKind::Grok: {
+            GrokAgentRuntime runtime;
             runtime.start();
             break;
         }

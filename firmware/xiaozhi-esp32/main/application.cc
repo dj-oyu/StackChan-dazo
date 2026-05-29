@@ -485,6 +485,11 @@ void Application::InitializeProtocol() {
         protocol_ = std::make_unique<GptRealtimeProtocol>();
         // OpenAI realtime wants PCM input, so skip the Opus encode on the mic path.
         audio_service_.EnableRawPcmSend(true);
+    } else if (provider == "grok") {
+        ESP_LOGI(TAG, "Using Grok Voice Agent protocol");
+        protocol_ = std::make_unique<GptRealtimeProtocol>(RealtimeProvider::Grok);
+        // Grok's realtime API also wants PCM input, so skip the Opus encode.
+        audio_service_.EnableRawPcmSend(true);
     } else if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
@@ -902,8 +907,15 @@ void Application::HandleStateChangedEvent() {
                 // This prevents audio truncation when STOP arrives late due to network jitter
                 if (listening_mode_ == kListeningModeAutoStop) {
                     audio_service_.WaitForPlaybackQueueEmpty();
+                    // The realtime providers disable the AFE while speaking, so it
+                    // re-calibrates when re-enabled here. An empty playback queue
+                    // doesn't mean the speaker is silent yet (I2S DMA tail), so let
+                    // the tail die out before the AFE starts capturing.
+                    if (dynamic_cast<GptRealtimeProtocol*>(protocol_.get()) != nullptr) {
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                    }
                 }
-                
+
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
                 audio_service_.EnableVoiceProcessing(true);
@@ -928,8 +940,15 @@ void Application::HandleStateChangedEvent() {
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
+                // The realtime providers (GPT/Grok) stream a whole reply faster
+                // than real time. Keeping the AFE wake-word pipeline running
+                // during playback pegs CPU0 (audio_input/audio_detection),
+                // starves the output task and chops/stalls audio (task watchdog
+                // trips). We don't barge-in by wake word here, so idle the AFE
+                // while speaking; it's re-enabled (on silence) at listening.
+                bool realtime_provider = dynamic_cast<GptRealtimeProtocol*>(protocol_.get()) != nullptr;
                 // Only AFE wake word can be detected in speaking mode
-                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                audio_service_.EnableWakeWordDetection(realtime_provider ? false : audio_service_.IsAfeWakeWord());
             }
             audio_service_.ResetDecoder();
             break;

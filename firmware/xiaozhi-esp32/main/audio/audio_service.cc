@@ -60,6 +60,13 @@ AudioService::~AudioService() {
 }
 
 void AudioService::Initialize(AudioCodec* codec) {
+    // During speaking we pause the AFE fetch side, so its mic FEED ringbuffer
+    // overflows and esp-sr logs "Ringbuffer of AFE(FEED) is full" dozens of times
+    // a second. That mic data is unused while speaking, but the warning flood
+    // blocks the audio tasks on UART (~8ms/line at 115200) and audibly chops
+    // playback. Silence AFE warnings; real failures still surface at ERROR.
+    esp_log_level_set("AFE", ESP_LOG_ERROR);
+
     codec_ = codec;
     codec_->Start();
 
