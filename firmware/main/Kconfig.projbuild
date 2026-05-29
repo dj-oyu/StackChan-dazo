@@ -14,7 +14,7 @@ config OPENAI_API_KEY
 
 config OPENAI_REALTIME_MODEL
     string "OpenAI Realtime model"
-    default "gpt-realtime"
+    default "gpt-realtime-2"
     help
         Realtime model used by the GPT provider.
 

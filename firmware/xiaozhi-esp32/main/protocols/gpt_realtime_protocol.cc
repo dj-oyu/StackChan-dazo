@@ -154,7 +154,6 @@ bool GptRealtimeProtocol::OpenAudioChannel()
 
     std::string bearer = "Bearer " + api_key_;
     websocket_->SetHeader("Authorization", bearer.c_str());
-    websocket_->SetHeader("OpenAI-Beta", "realtime=v1");
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
     websocket_->SetReceiveBufferSize(16384);
@@ -236,7 +235,6 @@ bool GptRealtimeProtocol::SendSessionUpdate()
 
     cJSON* output_modalities = cJSON_AddArrayToObject(session, "output_modalities");
     cJSON_AddItemToArray(output_modalities, cJSON_CreateString("audio"));
-    cJSON_AddItemToArray(output_modalities, cJSON_CreateString("text"));
 
     cJSON* audio = cJSON_AddObjectToObject(session, "audio");
     cJSON* input = cJSON_AddObjectToObject(audio, "input");
@@ -248,6 +246,7 @@ bool GptRealtimeProtocol::SendSessionUpdate()
     cJSON* output = cJSON_AddObjectToObject(audio, "output");
     cJSON* output_format = cJSON_AddObjectToObject(output, "format");
     cJSON_AddStringToObject(output_format, "type", "audio/pcm");
+    cJSON_AddNumberToObject(output_format, "rate", kOutputSampleRate);
     cJSON_AddStringToObject(output, "voice", voice_.c_str());
 
     char* json = cJSON_PrintUnformatted(root);
@@ -345,6 +344,7 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
 
     auto type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type)) {
+        ESP_LOGD(TAG, "Realtime event: %s", type->valuestring);
         if (strcmp(type->valuestring, "session.created") == 0 || strcmp(type->valuestring, "session.updated") == 0) {
             xEventGroupSetBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
         } else if (strcmp(type->valuestring, "response.output_audio.delta") == 0 ||
@@ -363,6 +363,7 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
         } else if (strcmp(type->valuestring, "error") == 0) {
             auto error = cJSON_GetObjectItem(root, "error");
             auto msg = cJSON_GetObjectItem(error, "message");
+            ESP_LOGE(TAG, "Realtime error: %s", cJSON_IsString(msg) ? msg->valuestring : "(no message)");
             SetError(cJSON_IsString(msg) ? msg->valuestring : Lang::Strings::SERVER_ERROR);
         }
     }
