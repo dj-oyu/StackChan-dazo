@@ -393,6 +393,16 @@ void StackChanAvatarDisplay::SetChatMessage(const char* role, const char* conten
     }
 }
 
+void StackChanAvatarDisplay::OnChatMessageComplete()
+{
+    auto& stackchan = GetStackChan();
+    if (!stackchan.hasAvatar()) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    stackchan.avatar().onSpeechComplete();
+}
+
 void StackChanAvatarDisplay::ClearChatMessages()
 {
     auto& stackchan = GetStackChan();

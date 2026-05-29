@@ -505,7 +505,12 @@ void Application::InitializeProtocol() {
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            // PCM (e.g. OpenAI realtime) is paced from a large PSRAM buffer in the
+            // protocol. Apply backpressure (wait) instead of dropping when the small
+            // decode queue is full, so long replies aren't truncated; the protocol's
+            // PSRAM queue absorbs the burst while we block.
+            bool backpressure = (packet->format == AudioStreamFormat::kPcm);
+            audio_service_.PushPacketToDecodeQueue(std::move(packet), backpressure);
         }
     });
     
@@ -554,6 +559,10 @@ void Application::InitializeProtocol() {
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
+            } else if (strcmp(state->valuestring, "complete") == 0) {
+                Schedule([display]() {
+                    display->OnChatMessageComplete();
+                });
             }
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");

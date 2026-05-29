@@ -9,6 +9,7 @@
 #include <lvgl.h>
 #include <smooth_lvgl.hpp>
 #include <memory>
+#include <string>
 
 namespace stackchan::avatar {
 
@@ -81,6 +82,7 @@ public:
     ~DefaultSpeechBubble();
 
     void setSpeech(std::string_view text) override;
+    void onSpeechComplete() override;
     void clearSpeech() override;
     void setVisible(bool visible) override;
     void setTextFont(void* font) override;
@@ -90,6 +92,8 @@ private:
     std::unique_ptr<uitk::lvgl_cpp::Image> _arrow;
     std::unique_ptr<uitk::lvgl_cpp::Container> _bubble;
     std::unique_ptr<uitk::lvgl_cpp::Label> _text;
+    std::string _shown;            // last text set (reused buffer; enables dedup)
+    int32_t _overflow = 0;         // current vertical overflow (px) of the text
 };
 
 }  // namespace stackchan::avatar

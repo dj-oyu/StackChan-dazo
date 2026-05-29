@@ -22,6 +22,12 @@ public:
     {
     }
 
+    // Called once when the streamed message is complete; the default bubble uses
+    // this to start the read-through scroll loop (it doesn't loop while streaming).
+    virtual void onSpeechComplete()
+    {
+    }
+
     virtual void clearSpeech()
     {
     }

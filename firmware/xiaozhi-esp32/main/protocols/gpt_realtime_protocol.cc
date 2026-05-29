@@ -438,6 +438,11 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
             if (text_only_stop) {
                 EmitTtsState("stop");
             }
+            // The whole reply (incl. transcript) is in; tell the display it can start
+            // looping the text. response.done is the single terminal event.
+            if (strcmp(type->valuestring, "response.done") == 0) {
+                EmitTtsState("complete");
+            }
         } else if (strcmp(type->valuestring, "response.output_audio_transcript.delta") == 0 ||
                    strcmp(type->valuestring, "response.audio_transcript.delta") == 0 ||
                    strcmp(type->valuestring, "response.output_text.delta") == 0) {
