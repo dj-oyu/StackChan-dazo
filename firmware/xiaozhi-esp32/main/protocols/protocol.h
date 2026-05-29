@@ -11,6 +11,10 @@ struct AudioStreamPacket {
     int sample_rate = 0;
     int frame_duration = 0;
     uint32_t timestamp = 0;
+    // When true, payload is raw little-endian int16 PCM (already decoded), not
+    // Opus. The decode task plays it directly, skipping the Opus decoder. Used by
+    // protocols (e.g. OpenAI realtime) that deliver PCM instead of Opus.
+    bool is_pcm = false;
     std::vector<uint8_t> payload;
 };
 

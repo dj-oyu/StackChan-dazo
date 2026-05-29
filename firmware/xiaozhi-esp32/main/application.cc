@@ -954,6 +954,9 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 ListeningMode Application::GetDefaultListeningMode() const {
+    if (dynamic_cast<GptRealtimeProtocol*>(protocol_.get()) != nullptr) {
+        return kListeningModeAutoStop;
+    }
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
 }
 
