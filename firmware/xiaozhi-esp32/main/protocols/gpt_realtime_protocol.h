@@ -14,9 +14,17 @@
 
 class WebSocket;
 
+// The OpenAI Realtime and xAI Grok Voice Agent APIs speak the same WebSocket
+// protocol; only the endpoint, auth/NVS namespace and session.update shape
+// differ. This single protocol implementation serves both, selected here.
+enum class RealtimeProvider {
+    OpenAi,
+    Grok,
+};
+
 class GptRealtimeProtocol : public Protocol {
 public:
-    GptRealtimeProtocol();
+    explicit GptRealtimeProtocol(RealtimeProvider provider = RealtimeProvider::OpenAi);
     ~GptRealtimeProtocol();
 
     bool Start() override;
@@ -72,15 +80,29 @@ private:
     bool output_audio_task_running_ = false;
     bool output_new_response_ = false;
     uint32_t input_audio_packet_count_ = 0;
+    RealtimeProvider provider_ = RealtimeProvider::OpenAi;
     std::string api_key_;
     std::string model_;
     std::string voice_;
     std::string instructions_;
     std::string url_;
+    // Grok server-VAD tuning (NVS-overridable in the "grok" namespace). Defaults
+    // match xAI's documented defaults; OpenAI uses its own fixed values above.
+    // Threshold is stored as an integer percent (85 -> 0.85) since NVS has no float.
+    int grok_vad_threshold_pct_ = 60;
+    int grok_vad_silence_ms_ = 700;
+    int grok_vad_prefix_ms_ = 333;
+    // Digital gain applied to mic PCM before sending (NVS: grok/mic_gain). The
+    // mic level reaching Grok is low, so its VAD ignores normal speech; amplify
+    // it. 1 = unchanged (OpenAI path).
+    int mic_gain_ = 1;
+
+    const char* ProviderName() const;
 
     void LoadSettings();
     bool EnsureCodecs();
     bool SendSessionUpdate();
+    bool SendGrokSessionUpdate();
     void HandleTextMessage(const char* data, size_t len);
     void HandleAudioDelta(const cJSON* root);
     void HandleTranscriptDelta(const cJSON* root);

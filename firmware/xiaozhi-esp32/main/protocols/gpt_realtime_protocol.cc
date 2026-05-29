@@ -35,7 +35,8 @@
         .self_delimited = false,                                                                          \
     }
 
-GptRealtimeProtocol::GptRealtimeProtocol()
+GptRealtimeProtocol::GptRealtimeProtocol(RealtimeProvider provider)
+    : provider_(provider)
 {
     event_group_handle_ = xEventGroupCreate();
     server_sample_rate_ = kOutputSampleRate;
@@ -66,8 +67,35 @@ bool GptRealtimeProtocol::Start()
     return true;
 }
 
+const char* GptRealtimeProtocol::ProviderName() const
+{
+    return provider_ == RealtimeProvider::Grok ? "Grok" : "OpenAI";
+}
+
 void GptRealtimeProtocol::LoadSettings()
 {
+    if (provider_ == RealtimeProvider::Grok) {
+        // xAI Grok Voice Agent API. Credentials/overrides live in the NVS
+        // namespace "grok"; CONFIG_GROK_* are the build-time fallbacks.
+        Settings settings("grok", false);
+        api_key_ = settings.GetString("api_key", CONFIG_GROK_API_KEY);
+        model_ = settings.GetString("model", CONFIG_GROK_VOICE_MODEL);
+        voice_ = settings.GetString("voice", CONFIG_GROK_VOICE);
+        instructions_ = settings.GetString("instructions", CONFIG_GROK_INSTRUCTIONS);
+        url_ = settings.GetString("url", "");
+        if (url_.empty()) {
+            url_ = "wss://api.x.ai/v1/realtime?model=" + model_;
+        }
+        // Grok server-VAD activation threshold (percent -> 0..1). 0.6 detected
+        // reliably while the AFE ran continuously; detection problems came from
+        // cycling the AFE off during speaking, not from this value.
+        grok_vad_threshold_pct_ = settings.GetInt("vad_threshold", 60);
+        grok_vad_silence_ms_ = settings.GetInt("vad_silence_ms", 700);
+        grok_vad_prefix_ms_ = settings.GetInt("vad_prefix_ms", 333);
+        mic_gain_ = settings.GetInt("mic_gain", 8);
+        return;
+    }
+
     Settings settings("openai", false);
     api_key_ = settings.GetString("api_key", CONFIG_OPENAI_API_KEY);
     model_ = settings.GetString("model", CONFIG_OPENAI_REALTIME_MODEL);
@@ -114,7 +142,7 @@ bool GptRealtimeProtocol::OpenAudioChannel()
 {
     LoadSettings();
     if (api_key_.empty()) {
-        SetError("OpenAI API key is not configured");
+        SetError(std::string(ProviderName()) + " API key is not configured");
         return false;
     }
     if (!EnsureCodecs()) {
@@ -174,9 +202,9 @@ bool GptRealtimeProtocol::OpenAudioChannel()
         }
     });
 
-    ESP_LOGI(TAG, "Connecting to OpenAI Realtime: %s", url_.c_str());
+    ESP_LOGI(TAG, "Connecting to %s Realtime: %s", ProviderName(), url_.c_str());
     if (!websocket_->Connect(url_.c_str())) {
-        ESP_LOGE(TAG, "Failed to connect OpenAI Realtime, code=%d", websocket_->GetLastError());
+        ESP_LOGE(TAG, "Failed to connect %s Realtime, code=%d", ProviderName(), websocket_->GetLastError());
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
         return false;
     }
@@ -242,6 +270,10 @@ bool GptRealtimeProtocol::SendText(const std::string& text)
 
 bool GptRealtimeProtocol::SendSessionUpdate()
 {
+    if (provider_ == RealtimeProvider::Grok) {
+        return SendGrokSessionUpdate();
+    }
+
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "session.update");
 
@@ -280,6 +312,44 @@ bool GptRealtimeProtocol::SendSessionUpdate()
     return SendText(message);
 }
 
+bool GptRealtimeProtocol::SendGrokSessionUpdate()
+{
+    // Grok's Voice Agent API takes the OpenAI beta-style session shape: voice,
+    // instructions and turn_detection sit at the session top level (no
+    // session.type / model / output_modalities), and the audio object only
+    // carries input/output formats. The model is pinned via the URL query param.
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "session.update");
+
+    cJSON* session = cJSON_AddObjectToObject(root, "session");
+    cJSON_AddStringToObject(session, "voice", voice_.c_str());
+    cJSON_AddStringToObject(session, "instructions", instructions_.c_str());
+
+    cJSON* turn_detection = cJSON_AddObjectToObject(session, "turn_detection");
+    cJSON_AddStringToObject(turn_detection, "type", "server_vad");
+    cJSON_AddNumberToObject(turn_detection, "threshold", grok_vad_threshold_pct_ / 100.0);
+    cJSON_AddNumberToObject(turn_detection, "prefix_padding_ms", grok_vad_prefix_ms_);
+    cJSON_AddNumberToObject(turn_detection, "silence_duration_ms", grok_vad_silence_ms_);
+
+    cJSON* audio = cJSON_AddObjectToObject(session, "audio");
+    cJSON* input = cJSON_AddObjectToObject(audio, "input");
+    cJSON* input_format = cJSON_AddObjectToObject(input, "format");
+    cJSON_AddStringToObject(input_format, "type", "audio/pcm");
+    cJSON_AddNumberToObject(input_format, "rate", kInputSampleRate);
+
+    cJSON* output = cJSON_AddObjectToObject(audio, "output");
+    cJSON* output_format = cJSON_AddObjectToObject(output, "format");
+    cJSON_AddStringToObject(output_format, "type", "audio/pcm");
+    cJSON_AddNumberToObject(output_format, "rate", kOutputSampleRate);
+
+    char* json = cJSON_PrintUnformatted(root);
+    std::string message(json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "Grok session.update: %s", message.c_str());
+    return SendText(message);
+}
+
 bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
 {
     // Don't feed mic audio while a response is being generated/played: with
@@ -308,6 +378,22 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
         return false;
     }
 
+    // Measure the pre-gain peak (to verify/tune the mic level) and amplify so
+    // Grok's server VAD reliably registers speech. Clip to int16.
+    int32_t peak = 0;
+    for (int16_t s : pcm) {
+        int32_t a = s < 0 ? -(int32_t)s : (int32_t)s;
+        if (a > peak) peak = a;
+    }
+    if (mic_gain_ > 1) {
+        for (auto& s : pcm) {
+            int32_t v = (int32_t)s * mic_gain_;
+            if (v > 32767) v = 32767;
+            else if (v < -32768) v = -32768;
+            s = (int16_t)v;
+        }
+    }
+
     auto encoded = Base64Encode(reinterpret_cast<const uint8_t*>(pcm.data()), pcm.size() * sizeof(int16_t));
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
@@ -320,7 +406,8 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
     input_audio_appended_ = true;
     input_audio_packet_count_++;
     if (input_audio_packet_count_ == 1 || input_audio_packet_count_ % 20 == 0) {
-        ESP_LOGI(TAG, "Sent input audio packet %lu (%u samples)", (unsigned long)input_audio_packet_count_, (unsigned)pcm.size());
+        ESP_LOGI(TAG, "Sent input audio packet %lu (%u samples) pre-gain peak %ld/32767 gain x%d",
+                 (unsigned long)input_audio_packet_count_, (unsigned)pcm.size(), (long)peak, mic_gain_);
     }
     return SendText(message);
 }
@@ -410,7 +497,14 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
 
     auto type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type)) {
-        ESP_LOGD(TAG, "Realtime event: %s", type->valuestring);
+        // Surface server turn-taking events at INFO for Grok so they can be
+        // followed from the serial log, but keep the high-rate streaming deltas
+        // (audio / transcript) at DEBUG so normal operation isn't spammed.
+        if (provider_ == RealtimeProvider::Grok && strstr(type->valuestring, ".delta") == nullptr) {
+            ESP_LOGI(TAG, "Realtime event: %s", type->valuestring);
+        } else {
+            ESP_LOGD(TAG, "Realtime event: %s", type->valuestring);
+        }
         if (strcmp(type->valuestring, "session.created") == 0 || strcmp(type->valuestring, "session.updated") == 0) {
             xEventGroupSetBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
         } else if (strcmp(type->valuestring, "response.output_audio.delta") == 0 ||
@@ -582,15 +676,30 @@ void GptRealtimeProtocol::OutputAudioTask()
     const TickType_t lead_ticks = frame_ticks * 3;
     TickType_t next_emit = xTaskGetTickCount();
 
+    // Lightweight per-response playback health, logged as a single line per turn
+    // (see finalize). underruns counts mid-response stalls long enough to drain
+    // the downstream cushion (network can't keep up); max_late tracks how far
+    // behind real-time pacing fell (CPU contention / accumulated stalls).
+    uint32_t pb_frames = 0;
+    uint32_t pb_underruns = 0;
+    int32_t pb_max_late_ms = 0;
+    bool pb_playing = false;
+
     while (true) {
         std::vector<uint8_t> bytes;
         bool new_response = false;
         bool finalize = false;
         {
             std::unique_lock<std::mutex> lock(output_audio_mutex_);
+            const bool may_starve = pb_playing && output_audio_queue_.empty() && !response_complete_;
+            const TickType_t wait_start = may_starve ? xTaskGetTickCount() : 0;
             output_audio_cv_.wait(lock, [this]() {
                 return !output_audio_task_running_ || !output_audio_queue_.empty() || response_complete_;
             });
+            if (may_starve && !output_audio_queue_.empty() &&
+                (xTaskGetTickCount() - wait_start) >= lead_ticks) {
+                pb_underruns++;
+            }
             if (!output_audio_task_running_) {
                 break;
             }
@@ -615,6 +724,11 @@ void GptRealtimeProtocol::OutputAudioTask()
                 response_audio_started_ = false;
                 response_transcript_.clear();
             }
+            if (pb_playing) {
+                ESP_LOGI(TAG, "Playback health: %u frames, %u underruns, max %dms behind",
+                         (unsigned)pb_frames, (unsigned)pb_underruns, (int)pb_max_late_ms);
+                pb_playing = false;
+            }
             EmitTtsState("stop");
             continue;
         }
@@ -627,6 +741,10 @@ void GptRealtimeProtocol::OutputAudioTask()
             // rest to real time.
             vTaskDelay(pdMS_TO_TICKS(kSpeakingSettleMs));
             next_emit = xTaskGetTickCount() - lead_ticks;
+            pb_frames = 0;
+            pb_underruns = 0;
+            pb_max_late_ms = 0;
+            pb_playing = true;
         }
 
         {
@@ -649,10 +767,16 @@ void GptRealtimeProtocol::OutputAudioTask()
             int32_t wait = (int32_t)(next_emit - xTaskGetTickCount());
             if (wait > 0) {
                 vTaskDelay((TickType_t)wait);
+            } else {
+                int32_t late_ms = (int32_t)(-wait) * portTICK_PERIOD_MS;
+                if (late_ms > pb_max_late_ms) {
+                    pb_max_late_ms = late_ms;
+                }
             }
             next_emit += frame_ticks;
 
             EmitOutputPcm(frame.data(), frame.size());
+            pb_frames++;
         }
     }
 

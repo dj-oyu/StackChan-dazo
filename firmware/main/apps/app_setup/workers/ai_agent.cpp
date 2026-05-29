@@ -277,11 +277,17 @@ AgentProviderWorker::AgentProviderWorker()
     _label_title->align(LV_ALIGN_TOP_MID, 0, 18);
 
     _roller = std::make_unique<Roller>(_panel_provider->get());
-    _roller->setOptions("GPT\nXiaozhi");
-    _roller->setVisibleRowCount(2);
+    _roller->setOptions("GPT\nGrok\nXiaozhi");
+    _roller->setVisibleRowCount(3);
     _roller->setWidth(180);
     _roller->align(LV_ALIGN_TOP_MID, 0, 58);
-    _roller->setSelected(provider == "xiaozhi" ? 1 : 0, LV_ANIM_OFF);
+    uint16_t selected = 0;  // GPT
+    if (provider == "grok") {
+        selected = 1;
+    } else if (provider == "xiaozhi") {
+        selected = 2;
+    }
+    _roller->setSelected(selected, LV_ANIM_OFF);
 
     _btn_confirm = std::make_unique<Button>(_panel->get());
     apply_button_common_style(*_btn_confirm);
@@ -299,7 +305,18 @@ void AgentProviderWorker::update()
 
     _confirm_flag = false;
     Settings settings("agent", true);
-    auto provider = _roller->getSelected() == 1 ? "xiaozhi" : "gpt";
+    const char* provider = "gpt";
+    switch (_roller->getSelected()) {
+        case 1:
+            provider = "grok";
+            break;
+        case 2:
+            provider = "xiaozhi";
+            break;
+        default:
+            provider = "gpt";
+            break;
+    }
     settings.SetString("provider", provider);
     mclog::tagInfo(_tag, "agent provider updated: {}", provider);
     _is_done = true;

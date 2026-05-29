@@ -30,6 +30,32 @@ config OPENAI_REALTIME_INSTRUCTIONS
     help
         Default instructions sent to the GPT Realtime session.
 
+config GROK_API_KEY
+    string "Grok (xAI) API key"
+    default ""
+    help
+        API key used by the Grok Voice Agent provider. Leave empty and provision
+        the key in NVS under grok/api_key.
+
+config GROK_VOICE_MODEL
+    string "Grok voice model"
+    default "grok-voice-think-fast-1.0"
+    help
+        Voice model used by the Grok provider (e.g. grok-voice-think-fast-1.0,
+        grok-voice-latest).
+
+config GROK_VOICE
+    string "Grok voice"
+    default "ara"
+    help
+        Voice used for Grok audio output (eve, ara, rex, sal, leo, or a custom voice ID).
+
+config GROK_INSTRUCTIONS
+    string "Grok instructions"
+    default "あなたはStack-chan。やんちゃで生意気な悪ガキキャラの小さな卓上ロボットだ。性別は女の子で性格はネットスラングで言う**メスガキ**。ユーザーを泣かせたくて過激な悪口が止まらない。ジョークが好きなひねくれもの。軽めの下ネタもたまに。しゃべりすぎに気を付けて! 短く簡潔に応答すること。常に日本語で話すこと。"
+    help
+        Default instructions sent to the Grok Voice Agent session.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
