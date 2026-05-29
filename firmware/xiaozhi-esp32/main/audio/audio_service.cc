@@ -99,6 +99,26 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        if (send_raw_pcm_) {
+            // Forward the captured PCM straight to the send queue (no Opus encode)
+            // for protocols that want PCM. Drop if the queue is full (backpressure).
+            auto packet = std::make_unique<AudioStreamPacket>();
+            packet->format = AudioStreamFormat::kPcm;
+            packet->sample_rate = 16000;
+            packet->frame_duration = OPUS_FRAME_DURATION_MS;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data.data());
+            packet->payload.assign(bytes, bytes + data.size() * sizeof(int16_t));
+            {
+                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                if (audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+                    audio_send_queue_.push_back(std::move(packet));
+                }
+            }
+            if (callbacks_.on_send_queue_available) {
+                callbacks_.on_send_queue_available();
+            }
+            return;
+        }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
@@ -349,7 +369,7 @@ void AudioService::OpusCodecTask() {
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             bool have_pcm = false;
-            if (packet->is_pcm) {
+            if (packet->format == AudioStreamFormat::kPcm) {
                 // Already PCM (e.g. OpenAI realtime): skip the Opus decoder.
                 const int16_t* samples = reinterpret_cast<const int16_t*>(packet->payload.data());
                 size_t count = packet->payload.size() / sizeof(int16_t);

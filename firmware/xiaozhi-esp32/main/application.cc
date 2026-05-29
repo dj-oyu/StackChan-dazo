@@ -483,6 +483,8 @@ void Application::InitializeProtocol() {
     if (provider == "gpt") {
         ESP_LOGI(TAG, "Using GPT Realtime protocol");
         protocol_ = std::make_unique<GptRealtimeProtocol>();
+        // OpenAI realtime wants PCM input, so skip the Opus encode on the mic path.
+        audio_service_.EnableRawPcmSend(true);
     } else if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {

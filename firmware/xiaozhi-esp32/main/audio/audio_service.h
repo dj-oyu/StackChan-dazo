@@ -124,6 +124,10 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    // When enabled, captured mic audio is forwarded to the send queue as raw PCM
+    // (AudioStreamFormat::kPcm) instead of being Opus-encoded. Used by protocols
+    // that want PCM (e.g. OpenAI realtime), avoiding a pointless Opus round trip.
+    void EnableRawPcmSend(bool enable) { send_raw_pcm_ = enable; }
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -142,6 +146,7 @@ private:
     std::unique_ptr<AudioDebugger> audio_debugger_;
     void* opus_encoder_ = nullptr;
     void* opus_decoder_ = nullptr;
+    bool send_raw_pcm_ = false;
     std::mutex decoder_mutex_;
     std::mutex input_resampler_mutex_;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;

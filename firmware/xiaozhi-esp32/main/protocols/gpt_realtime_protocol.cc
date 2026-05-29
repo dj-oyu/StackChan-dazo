@@ -295,9 +295,15 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
     }
 
     std::vector<int16_t> pcm;
-    if (!DecodeInputOpus(*packet, pcm)) {
+    if (packet->format == AudioStreamFormat::kPcm) {
+        // Mic audio arrives as raw PCM (EnableRawPcmSend), so there's no Opus to
+        // decode — just reinterpret the payload.
+        const int16_t* samples = reinterpret_cast<const int16_t*>(packet->payload.data());
+        pcm.assign(samples, samples + packet->payload.size() / sizeof(int16_t));
+    } else if (!DecodeInputOpus(*packet, pcm)) {
         return false;
     }
+    // OpenAI realtime requires 24 kHz input, so resample from the 16 kHz mic rate.
     if (!ResampleInputPcm(pcm, packet->sample_rate)) {
         return false;
     }
@@ -693,7 +699,7 @@ void GptRealtimeProtocol::EmitOutputPcm(const int16_t* samples, size_t sample_co
         return;
     }
     // OpenAI realtime delivers PCM, and the device playback path can take PCM
-    // directly (AudioStreamPacket::is_pcm), so just forward it instead of doing a
+    // directly (AudioStreamFormat::kPcm), so just forward it instead of doing a
     // wasteful PCM->Opus->PCM round trip. This also keeps this task's stack tiny.
     std::vector<uint8_t> pcm_bytes(sample_count * sizeof(int16_t));
     memcpy(pcm_bytes.data(), samples, pcm_bytes.size());
@@ -702,7 +708,7 @@ void GptRealtimeProtocol::EmitOutputPcm(const int16_t* samples, size_t sample_co
         .sample_rate = kOutputSampleRate,
         .frame_duration = kFrameDurationMs,
         .timestamp = 0,
-        .is_pcm = true,
+        .format = AudioStreamFormat::kPcm,
         .payload = std::move(pcm_bytes),
     }));
 }

@@ -7,14 +7,19 @@
 #include <chrono>
 #include <vector>
 
+// Wire format of an AudioStreamPacket's payload. kOpus is the default used by the
+// xiaozhi websocket/mqtt servers; kPcm carries raw little-endian int16 mono PCM
+// (e.g. OpenAI realtime), which the decode path plays directly without Opus.
+enum class AudioStreamFormat {
+    kOpus,
+    kPcm,
+};
+
 struct AudioStreamPacket {
     int sample_rate = 0;
     int frame_duration = 0;
     uint32_t timestamp = 0;
-    // When true, payload is raw little-endian int16 PCM (already decoded), not
-    // Opus. The decode task plays it directly, skipping the Opus decoder. Used by
-    // protocols (e.g. OpenAI realtime) that deliver PCM instead of Opus.
-    bool is_pcm = false;
+    AudioStreamFormat format = AudioStreamFormat::kOpus;
     std::vector<uint8_t> payload;
 };
 
