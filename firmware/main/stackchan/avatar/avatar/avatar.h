@@ -83,6 +83,13 @@ public:
         }
     }
 
+    void onSpeechComplete()
+    {
+        if (getKeyElements().speechBubble) {
+            getKeyElements().speechBubble->onSpeechComplete();
+        }
+    }
+
     void clearSpeech()
     {
         if (getKeyElements().speechBubble) {

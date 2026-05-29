@@ -131,6 +131,8 @@ void Hal::updateHeapStatusLog()
 /*                                   Xiaozhi                                  */
 /* -------------------------------------------------------------------------- */
 #include "board/hal_bridge.h"
+#include <agent_runtime/gpt_agent_runtime.h>
+#include <agent_runtime/xiaozhi_agent_runtime.h>
 #include <stackchan/stackchan.h>
 #include <apps/common/common.h>
 #include <assets/assets.h>
@@ -200,6 +202,26 @@ void Hal::startXiaozhi()
     xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
 
     hal_bridge::start_xiaozhi_app();
+}
+
+void Hal::startRequestedAgentRuntime()
+{
+    switch (_requested_agent_runtime) {
+        case AgentRuntimeKind::Gpt: {
+            GptAgentRuntime runtime;
+            runtime.start();
+            break;
+        }
+        case AgentRuntimeKind::Xiaozhi: {
+            XiaozhiAgentRuntime runtime;
+            runtime.start();
+            break;
+        }
+        case AgentRuntimeKind::None:
+        default:
+            mclog::tagWarn(_tag, "agent runtime start requested without selected runtime");
+            break;
+    }
 }
 
 XiaozhiConfig_t Hal::getXiaozhiConfig()

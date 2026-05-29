@@ -356,6 +356,24 @@ private:
  * @brief
  *
  */
+class AgentProviderWorker : public WorkerBase {
+public:
+    AgentProviderWorker();
+    void update() override;
+
+private:
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_provider;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_title;
+    std::unique_ptr<uitk::lvgl_cpp::Roller> _roller;
+    std::unique_ptr<uitk::lvgl_cpp::Button> _btn_confirm;
+    bool _confirm_flag = false;
+};
+
+/**
+ * @brief
+ *
+ */
 class TimezoneWorker : public WorkerBase {
 public:
     TimezoneWorker();

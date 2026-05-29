@@ -37,8 +37,14 @@
 # Build files
 build/
 cmake-build-*/
-/components/
-managed_components/
+components/*
+!components/esp-now/
+!components/esp-now/**
+!components/jp_font/
+!components/jp_font/**
+managed_components/*
+!managed_components/78__esp-ml307/
+!managed_components/78__esp-ml307/**
 
 # PlatformIO
 .pio/
@@ -64,4 +70,5 @@ obj/
 sdkconfig
 sdkconfig.old
 
-xiaozhi-esp32/
+!xiaozhi-esp32/
+!xiaozhi-esp32/**

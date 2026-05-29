@@ -18,8 +18,6 @@
 #include <assets.h>
 #include <settings.h>
 
-static const char* _tag = "HAL_BRIDGE";
-
 static constexpr std::string_view _xiaozhi_config_nvs_ns                           = "xiaozhi";
 static constexpr std::string_view _xiaozhi_config_idle_shutdown_time_key           = "idle_sec";
 static constexpr std::string_view _xiaozhi_config_allow_shutdown_when_charging_key = "ext_pwr";
@@ -105,7 +103,7 @@ void disply_lvgl_unlock()
 void xiaozhi_board_init()
 {
     // Init board
-    auto& board = Board::GetInstance();
+    Board::GetInstance();
 }
 
 void start_xiaozhi_app()

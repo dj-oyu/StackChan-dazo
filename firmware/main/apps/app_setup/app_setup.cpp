@@ -72,7 +72,13 @@ void AppSetup::onOpen()
         },
         {
             "AI.Agent",
-            {{"General",
+            {{"Provider",
+              [&]() {
+                  _destroy_menu    = true;
+                  _need_warm_reset = true;
+                  _worker          = std::make_unique<AgentProviderWorker>();
+              }},
+             {"General",
               [&]() {
                   _destroy_menu    = true;
                   _need_warm_reset = true;

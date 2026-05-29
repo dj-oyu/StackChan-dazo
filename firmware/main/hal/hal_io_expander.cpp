@@ -6,6 +6,8 @@
 #include "hal.h"
 #include "board/hal_bridge.h"
 #include "drivers/PY32IOExpander_Class/PY32IOExpander_Class.hpp"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <mooncake_log.h>
 #include <memory>
 
