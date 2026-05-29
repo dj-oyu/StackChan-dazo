@@ -44,9 +44,9 @@ private:
     static constexpr int kSpeakingSettleMs = 120;
 
     std::unique_ptr<WebSocket> websocket_;
+    mutable std::mutex websocket_mutex_;
     EventGroupHandle_t event_group_handle_ = nullptr;
     void* input_opus_decoder_ = nullptr;
-    void* output_opus_encoder_ = nullptr;
     void* input_resampler_ = nullptr;
     std::mutex codec_mutex_;
     std::mutex output_audio_mutex_;
@@ -84,7 +84,7 @@ private:
     void OutputAudioTask();
     bool DecodeInputOpus(const AudioStreamPacket& packet, std::vector<int16_t>& pcm);
     bool ResampleInputPcm(std::vector<int16_t>& pcm, int from_sample_rate);
-    bool EmitOutputPcm(const int16_t* samples, size_t sample_count);
+    void EmitOutputPcm(const int16_t* samples, size_t sample_count);
     static std::string Base64Encode(const uint8_t* data, size_t len);
     static std::vector<uint8_t> Base64Decode(const char* data);
 };

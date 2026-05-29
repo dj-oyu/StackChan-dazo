@@ -35,21 +35,6 @@
         .self_delimited = false,                                                                          \
     }
 
-#define OPUS_ENC_CFG(_sample_rate, _frame_duration_ms)                                                    \
-    (esp_opus_enc_config_t)                                                                               \
-    {                                                                                                     \
-        .sample_rate      = (int)(_sample_rate),                                                          \
-        .channel          = ESP_AUDIO_MONO,                                                               \
-        .bits_per_sample  = ESP_AUDIO_BIT16,                                                             \
-        .bitrate          = ESP_OPUS_BITRATE_AUTO,                                                        \
-        .frame_duration   = (esp_opus_enc_frame_duration_t)AS_OPUS_GET_FRAME_DRU_ENUM(_frame_duration_ms),\
-        .application_mode = ESP_OPUS_ENC_APPLICATION_AUDIO,                                               \
-        .complexity       = 0,                                                                            \
-        .enable_fec       = false,                                                                        \
-        .enable_dtx       = false,                                                                        \
-        .enable_vbr       = true,                                                                         \
-    }
-
 GptRealtimeProtocol::GptRealtimeProtocol()
 {
     event_group_handle_ = xEventGroupCreate();
@@ -67,9 +52,6 @@ GptRealtimeProtocol::~GptRealtimeProtocol()
     StopOutputAudioTask();
     if (input_opus_decoder_ != nullptr) {
         esp_opus_dec_close(input_opus_decoder_);
-    }
-    if (output_opus_encoder_ != nullptr) {
-        esp_opus_enc_close(output_opus_encoder_);
     }
     if (input_resampler_ != nullptr) {
         esp_ae_rate_cvt_close(input_resampler_);
@@ -142,21 +124,25 @@ bool GptRealtimeProtocol::OpenAudioChannel()
 
     error_occurred_ = false;
     audio_channel_opened_ = false;
-    response_audio_started_ = false;
-    response_active_ = false;
     input_audio_appended_ = false;
     input_audio_packet_count_ = 0;
     {
         std::lock_guard<std::mutex> lock(output_audio_mutex_);
+        response_audio_started_ = false;
+        response_active_ = false;
+        response_complete_ = false;
+        response_transcript_.clear();
         output_pcm_buffer_.clear();
         output_audio_queue_.clear();
         output_new_response_ = false;
-        response_complete_ = false;
     }
     xEventGroupClearBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
 
     auto network = Board::GetInstance().GetNetwork();
-    websocket_ = network->CreateWebSocket(1);
+    {
+        std::lock_guard<std::mutex> lock(websocket_mutex_);
+        websocket_ = network->CreateWebSocket(1);
+    }
     if (websocket_ == nullptr) {
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
         return false;
@@ -176,6 +162,13 @@ bool GptRealtimeProtocol::OpenAudioChannel()
     websocket_->OnDisconnected([this]() {
         ESP_LOGI(TAG, "Realtime websocket disconnected");
         audio_channel_opened_ = false;
+        // Let the output task drain whatever is buffered and emit "stop" so the
+        // device doesn't get stuck in the speaking state with a wedged turn.
+        {
+            std::lock_guard<std::mutex> lock(output_audio_mutex_);
+            response_complete_ = true;
+        }
+        output_audio_cv_.notify_all();
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
         }
@@ -213,20 +206,34 @@ void GptRealtimeProtocol::CloseAudioChannel(bool send_goodbye)
 {
     (void)send_goodbye;
     audio_channel_opened_ = false;
-    websocket_.reset();
+    // Move the socket out under the lock and destroy it after releasing it, so a
+    // concurrent SendText/IsAudioChannelOpened can't use a half-destroyed socket
+    // and we don't hold the lock across the (possibly thread-joining) destructor.
+    std::unique_ptr<WebSocket> ws;
+    {
+        std::lock_guard<std::mutex> lock(websocket_mutex_);
+        ws = std::move(websocket_);
+    }
+    ws.reset();
 }
 
 bool GptRealtimeProtocol::IsAudioChannelOpened() const
 {
+    std::lock_guard<std::mutex> lock(websocket_mutex_);
     return websocket_ != nullptr && websocket_->IsConnected() && audio_channel_opened_ && !error_occurred_ && !IsTimeout();
 }
 
 bool GptRealtimeProtocol::SendText(const std::string& text)
 {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
-        return false;
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lock(websocket_mutex_);
+        if (websocket_ == nullptr || !websocket_->IsConnected()) {
+            return false;
+        }
+        ok = websocket_->Send(text);
     }
-    if (!websocket_->Send(text)) {
+    if (!ok) {
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
     }
@@ -278,7 +285,12 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
     // Don't feed mic audio while a response is being generated/played: with
     // server VAD + interrupt_response the device would otherwise interrupt its own
     // reply (e.g. via speaker echo).
-    if (!IsAudioChannelOpened() || packet == nullptr || response_active_) {
+    bool response_active;
+    {
+        std::lock_guard<std::mutex> lock(output_audio_mutex_);
+        response_active = response_active_;
+    }
+    if (!IsAudioChannelOpened() || packet == nullptr || response_active) {
         return false;
     }
 
@@ -312,15 +324,15 @@ void GptRealtimeProtocol::SendStartListening(ListeningMode mode)
     (void)mode;
     input_audio_appended_ = false;
     input_audio_packet_count_ = 0;
-    response_audio_started_ = false;
-    response_active_ = false;
-    response_transcript_.clear();
     {
         std::lock_guard<std::mutex> lock(output_audio_mutex_);
+        response_audio_started_ = false;
+        response_active_ = false;
+        response_complete_ = false;
+        response_transcript_.clear();
         output_pcm_buffer_.clear();
         output_audio_queue_.clear();
         output_new_response_ = false;
-        response_complete_ = false;
     }
     SendText("{\"type\":\"input_audio_buffer.clear\"}");
 }
@@ -330,14 +342,12 @@ void GptRealtimeProtocol::SendStopListening()
     if (!input_audio_appended_) {
         return;
     }
-    // Server VAD (turn_detection) commits the buffer and creates the response on
-    // its own. If it already started one, don't create a second (the API rejects a
-    // response while one is active); just commit any trailing audio.
+    // Server VAD (turn_detection) commits the buffer and creates the response on its
+    // own. We only flush a trailing commit; we never send response.create ourselves,
+    // because racing the server's auto-created response triggers a fatal
+    // "conversation already has an active response" error.
     ESP_LOGI(TAG, "Committing input audio after %lu packets", (unsigned long)input_audio_packet_count_);
     SendText("{\"type\":\"input_audio_buffer.commit\"}");
-    if (!response_active_) {
-        SendText("{\"type\":\"response.create\"}");
-    }
     input_audio_appended_ = false;
     input_audio_packet_count_ = 0;
 }
@@ -346,17 +356,17 @@ void GptRealtimeProtocol::SendAbortSpeaking(AbortReason reason)
 {
     (void)reason;
     SendText("{\"type\":\"response.cancel\"}");
-    EmitTtsState("stop");
-    response_audio_started_ = false;
-    response_active_ = false;
-    response_transcript_.clear();
     {
         std::lock_guard<std::mutex> lock(output_audio_mutex_);
+        response_audio_started_ = false;
+        response_active_ = false;
+        response_complete_ = false;
+        response_transcript_.clear();
         output_pcm_buffer_.clear();
         output_audio_queue_.clear();
         output_new_response_ = false;
-        response_complete_ = false;
     }
+    EmitTtsState("stop");
 }
 
 void GptRealtimeProtocol::SendWakeWordDetected(const std::string& wake_word)
@@ -414,12 +424,12 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
                     response_complete_ = true;
                 } else if (response_active_ && !response_complete_) {
                     response_active_ = false;
+                    response_transcript_.clear();
                     text_only_stop = true;
                 }
             }
             output_audio_cv_.notify_all();
             if (text_only_stop) {
-                response_transcript_.clear();
                 EmitTtsState("stop");
             }
         } else if (strcmp(type->valuestring, "response.output_audio_transcript.delta") == 0 ||
@@ -450,21 +460,20 @@ void GptRealtimeProtocol::HandleAudioDelta(const cJSON* root)
     }
 
     bool started_now = false;
-    if (!response_audio_started_) {
-        response_audio_started_ = true;
-        response_active_ = true;
-        started_now = true;
-        EmitTtsState("start");
-    }
-
     {
         std::lock_guard<std::mutex> lock(output_audio_mutex_);
-        if (started_now) {
+        if (!response_audio_started_) {
+            response_audio_started_ = true;
+            response_active_ = true;
             output_new_response_ = true;
+            started_now = true;
         }
         output_audio_queue_.push_back(std::move(bytes));
     }
     output_audio_cv_.notify_all();
+    if (started_now) {
+        EmitTtsState("start");
+    }
 }
 
 void GptRealtimeProtocol::HandleTranscriptDelta(const cJSON* root)
@@ -473,14 +482,21 @@ void GptRealtimeProtocol::HandleTranscriptDelta(const cJSON* root)
     if (!cJSON_IsString(delta) || delta->valuestring[0] == '\0') {
         return;
     }
-    // The transcript can start before the first audio frame; mark the response
-    // active so we stop streaming mic audio into it (see SendAudio).
-    response_active_ = true;
     // The realtime API streams the transcript in small deltas, but SetChatMessage
     // replaces the whole bubble. Accumulate and emit the full text so far so the
-    // bubble grows like a typewriter, in sync with the streamed audio.
-    response_transcript_ += delta->valuestring;
-    EmitTtsState("sentence_start", response_transcript_.c_str());
+    // bubble grows like a typewriter, in sync with the streamed audio. Snapshot the
+    // accumulated text under the lock so a concurrent clear (abort/finalize) can't
+    // race the std::string while we read it.
+    std::string snapshot;
+    {
+        std::lock_guard<std::mutex> lock(output_audio_mutex_);
+        // The transcript can start before the first audio frame; mark the response
+        // active so we stop streaming mic audio into it (see SendAudio).
+        response_active_ = true;
+        response_transcript_ += delta->valuestring;
+        snapshot = response_transcript_;
+    }
+    EmitTtsState("sentence_start", snapshot.c_str());
 }
 
 void GptRealtimeProtocol::EmitTtsState(const char* state, const char* text)
@@ -571,8 +587,8 @@ void GptRealtimeProtocol::OutputAudioTask()
                 response_complete_ = false;
                 response_active_ = false;
                 response_audio_started_ = false;
+                response_transcript_.clear();
             }
-            response_transcript_.clear();
             EmitTtsState("stop");
             continue;
         }
@@ -610,9 +626,7 @@ void GptRealtimeProtocol::OutputAudioTask()
             }
             next_emit += frame_ticks;
 
-            if (!EmitOutputPcm(frame.data(), frame.size())) {
-                break;
-            }
+            EmitOutputPcm(frame.data(), frame.size());
         }
     }
 
@@ -673,24 +687,24 @@ bool GptRealtimeProtocol::ResampleInputPcm(std::vector<int16_t>& pcm, int from_s
     return true;
 }
 
-bool GptRealtimeProtocol::EmitOutputPcm(const int16_t* samples, size_t sample_count)
+void GptRealtimeProtocol::EmitOutputPcm(const int16_t* samples, size_t sample_count)
 {
+    if (on_incoming_audio_ == nullptr) {
+        return;
+    }
     // OpenAI realtime delivers PCM, and the device playback path can take PCM
     // directly (AudioStreamPacket::is_pcm), so just forward it instead of doing a
     // wasteful PCM->Opus->PCM round trip. This also keeps this task's stack tiny.
     std::vector<uint8_t> pcm_bytes(sample_count * sizeof(int16_t));
     memcpy(pcm_bytes.data(), samples, pcm_bytes.size());
 
-    if (on_incoming_audio_ != nullptr) {
-        on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
-            .sample_rate = kOutputSampleRate,
-            .frame_duration = kFrameDurationMs,
-            .timestamp = 0,
-            .is_pcm = true,
-            .payload = std::move(pcm_bytes),
-        }));
-    }
-    return true;
+    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+        .sample_rate = kOutputSampleRate,
+        .frame_duration = kFrameDurationMs,
+        .timestamp = 0,
+        .is_pcm = true,
+        .payload = std::move(pcm_bytes),
+    }));
 }
 
 std::string GptRealtimeProtocol::Base64Encode(const uint8_t* data, size_t len)
