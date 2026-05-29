@@ -479,7 +479,7 @@ void Application::InitializeProtocol() {
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
     Settings agent_settings("agent", false);
-    auto provider = agent_settings.GetString("session_provider", agent_settings.GetString("provider", "xiaozhi"));
+    auto provider = agent_settings.GetString("provider", "xiaozhi");
     if (provider == "gpt") {
         ESP_LOGI(TAG, "Using GPT Realtime protocol");
         protocol_ = std::make_unique<GptRealtimeProtocol>();

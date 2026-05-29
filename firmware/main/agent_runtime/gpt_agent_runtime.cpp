@@ -17,7 +17,7 @@ void GptAgentRuntime::start()
 
     {
         Settings settings("agent", true);
-        settings.SetString("session_provider", "gpt");
+        settings.SetString("provider", "gpt");
     }
 
     GetHAL().startXiaozhi();

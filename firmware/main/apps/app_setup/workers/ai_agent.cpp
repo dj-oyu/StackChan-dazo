@@ -301,7 +301,6 @@ void AgentProviderWorker::update()
     Settings settings("agent", true);
     auto provider = _roller->getSelected() == 1 ? "xiaozhi" : "gpt";
     settings.SetString("provider", provider);
-    settings.SetString("session_provider", provider);
     mclog::tagInfo(_tag, "agent provider updated: {}", provider);
     _is_done = true;
 }

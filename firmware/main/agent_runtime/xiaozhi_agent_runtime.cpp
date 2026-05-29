@@ -11,7 +11,7 @@ void XiaozhiAgentRuntime::start()
 {
     {
         Settings settings("agent", true);
-        settings.SetString("session_provider", "xiaozhi");
+        settings.SetString("provider", "xiaozhi");
     }
 
     GetHAL().startXiaozhi();
