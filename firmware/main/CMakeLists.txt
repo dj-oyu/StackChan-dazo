@@ -122,7 +122,10 @@ set(EMOTE_RESOLUTION "320_240")
 # Set default assets if the board uses partition table V2
 if(CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN)
     set(BOARD_TYPE "m5stack-stack-chan")
-    set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
+    # Japanese-capable UI font (Noto Sans CJK JP subset, components/jp_font). The
+    # non-"basic" name disables the assets-partition text_font override, so this
+    # compiled font is used; PuHui lacked Japanese-only kanji such as 窓.
+    set(BUILTIN_TEXT_FONT font_noto_jp_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 endif()

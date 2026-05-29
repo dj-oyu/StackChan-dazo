@@ -40,7 +40,11 @@ cmake-build-*/
 components/*
 !components/esp-now/
 !components/esp-now/**
-managed_components/
+!components/jp_font/
+!components/jp_font/**
+managed_components/*
+!managed_components/78__esp-ml307/
+!managed_components/78__esp-ml307/**
 
 # PlatformIO
 .pio/
