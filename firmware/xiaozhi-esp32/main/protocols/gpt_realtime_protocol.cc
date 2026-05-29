@@ -346,7 +346,7 @@ bool GptRealtimeProtocol::SendGrokSessionUpdate()
     std::string message(json);
     cJSON_free(json);
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "Grok session.update: %s", message.c_str());
+    ESP_LOGD(TAG, "Grok session.update: %s", message.c_str());
     return SendText(message);
 }
 
@@ -378,13 +378,8 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
         return false;
     }
 
-    // Measure the pre-gain peak (to verify/tune the mic level) and amplify so
-    // Grok's server VAD reliably registers speech. Clip to int16.
-    int32_t peak = 0;
-    for (int16_t s : pcm) {
-        int32_t a = s < 0 ? -(int32_t)s : (int32_t)s;
-        if (a > peak) peak = a;
-    }
+    // Amplify the mic PCM so Grok's server VAD reliably registers speech. Clip
+    // to int16. (Use a DEBUG log of the pre-gain peak when tuning grok/mic_gain.)
     if (mic_gain_ > 1) {
         for (auto& s : pcm) {
             int32_t v = (int32_t)s * mic_gain_;
@@ -406,8 +401,8 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
     input_audio_appended_ = true;
     input_audio_packet_count_++;
     if (input_audio_packet_count_ == 1 || input_audio_packet_count_ % 20 == 0) {
-        ESP_LOGI(TAG, "Sent input audio packet %lu (%u samples) pre-gain peak %ld/32767 gain x%d",
-                 (unsigned long)input_audio_packet_count_, (unsigned)pcm.size(), (long)peak, mic_gain_);
+        ESP_LOGD(TAG, "Sent input audio packet %lu (%u samples)",
+                 (unsigned long)input_audio_packet_count_, (unsigned)pcm.size());
     }
     return SendText(message);
 }
@@ -497,14 +492,7 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
 
     auto type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type)) {
-        // Surface server turn-taking events at INFO for Grok so they can be
-        // followed from the serial log, but keep the high-rate streaming deltas
-        // (audio / transcript) at DEBUG so normal operation isn't spammed.
-        if (provider_ == RealtimeProvider::Grok && strstr(type->valuestring, ".delta") == nullptr) {
-            ESP_LOGI(TAG, "Realtime event: %s", type->valuestring);
-        } else {
-            ESP_LOGD(TAG, "Realtime event: %s", type->valuestring);
-        }
+        ESP_LOGD(TAG, "Realtime event: %s", type->valuestring);
         if (strcmp(type->valuestring, "session.created") == 0 || strcmp(type->valuestring, "session.updated") == 0) {
             xEventGroupSetBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
         } else if (strcmp(type->valuestring, "response.output_audio.delta") == 0 ||
@@ -725,7 +713,7 @@ void GptRealtimeProtocol::OutputAudioTask()
                 response_transcript_.clear();
             }
             if (pb_playing) {
-                ESP_LOGI(TAG, "Playback health: %u frames, %u underruns, max %dms behind",
+                ESP_LOGD(TAG, "Playback health: %u frames, %u underruns, max %dms behind",
                          (unsigned)pb_frames, (unsigned)pb_underruns, (int)pb_max_late_ms);
                 pb_playing = false;
             }
