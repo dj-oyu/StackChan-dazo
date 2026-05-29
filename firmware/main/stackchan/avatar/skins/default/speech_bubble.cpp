@@ -12,22 +12,17 @@ using namespace uitk;
 using namespace uitk::lvgl_cpp;
 using namespace stackchan::avatar;
 
-// The container is transparent; it only groups the arrow + bubble and clips them.
-// Make it tall and anchored so an upward-growing 3-line bubble is never clipped.
-// (Its bottom edge stays at the original y=246; only the top is extended upward.)
+// The transparent container frames the bubble. The bubble is anchored to its
+// bottom edge (~y234) and grows upward, so multi-line text never runs off the
+// bottom of the screen.
 static const Vector2i _container_pos  = Vector2i(0, 46);
 static const Vector2i _container_size = Vector2i(320, 160);
-// Arrow offset compensates for the raised container centre so the tail stays put.
-static const Vector2i _arrow_offset   = Vector2i(40, 28);
 static const int _bubble_width        = 300;  // fixed width; height grows with text
 static const int _bubble_pad_x        = 14;
 static const int _bubble_pad_y        = 6;
 static const int _bubble_max_lines    = 2;   // grow up to this, then scroll/loop
-// Bubble bottom edge relative to the container bottom; it grows upward from here.
-static const int _bubble_bottom_ofs   = -12;
+static const int _bubble_bottom_ofs   = -12;  // bubble bottom relative to container bottom
 static const int _scroll_speed_pps    = 30;  // auto-scroll speed (px/sec) when looping
-
-LV_IMAGE_DECLARE(default_bubble_arrow);
 
 // Drives the looping vertical auto-scroll of overflowing text.
 static void bubble_scroll_anim_cb(void* obj, int32_t y)
@@ -50,16 +45,9 @@ DefaultSpeechBubble::DefaultSpeechBubble(lv_obj_t* parent, lv_color_t primaryCol
     // The bubble grows taller than the container for multi-line text; don't clip it.
     lv_obj_add_flag(_container->get(), LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 
-    _arrow = std::make_unique<Image>(_container->get());
-    _arrow->setSrc(&default_bubble_arrow);
-    _arrow->setAlign(LV_ALIGN_CENTER);
-    _arrow->setPos(_arrow_offset.x, _arrow_offset.y);
-    _arrow->setImageRecolorOpa(LV_OPA_COVER);
-    _arrow->setImageRecolor(primaryColor);
-
     _bubble = std::make_unique<Container>(_container->get());
     _bubble->setRadius(LV_RADIUS_CIRCLE);
-    // Anchor to the bottom and grow upward so the bubble never runs off-screen.
+    // Anchor to the bottom and grow upward so multi-line text never runs off-screen.
     _bubble->setAlign(LV_ALIGN_BOTTOM_MID);
     _bubble->setBorderWidth(0);
     _bubble->setBgColor(primaryColor);
@@ -97,7 +85,6 @@ DefaultSpeechBubble::~DefaultSpeechBubble()
 {
     _text.reset();
     _bubble.reset();
-    _arrow.reset();
     _container.reset();
 }
 
@@ -127,10 +114,10 @@ void DefaultSpeechBubble::setSpeech(std::string_view text)
     int line_space = lv_obj_get_style_text_line_space(_text->get(), LV_PART_MAIN);
 
     lv_obj_t* bubble = _bubble->get();
-    // Bubble height auto-fits the text (LV_SIZE_CONTENT); cap it at _bubble_max_lines
-    // worth of height so longer text scrolls instead of growing unboundedly. The +4
-    // guards against rounding so an exact N-line block isn't clipped.
-    int max_h = line_h * _bubble_max_lines + line_space * (_bubble_max_lines - 1) + _bubble_pad_y * 2 + 4;
+    // Bubble height auto-fits the text (LV_SIZE_CONTENT); cap the visible area at an
+    // EXACT integer number of lines so the scroll window always lands on line
+    // boundaries (no half-line slivers clipped at the top/bottom of the bubble).
+    int max_h = line_h * _bubble_max_lines + line_space * (_bubble_max_lines - 1) + _bubble_pad_y * 2;
     lv_obj_set_style_max_height(bubble, max_h, 0);
 
     lv_obj_update_layout(bubble);

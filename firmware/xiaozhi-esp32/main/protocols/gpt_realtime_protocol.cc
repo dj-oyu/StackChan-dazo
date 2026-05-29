@@ -424,8 +424,10 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
             // audio task emit "stop" once it has played out the buffered audio.
             // (A text-only response has no audio to drain, so end it immediately.)
             bool text_only_stop = false;
+            std::string final_text;
             {
                 std::lock_guard<std::mutex> lock(output_audio_mutex_);
+                final_text = response_transcript_;  // full text (display updates are throttled)
                 if (response_audio_started_) {
                     response_complete_ = true;
                 } else if (response_active_ && !response_complete_) {
@@ -435,11 +437,16 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
                 }
             }
             output_audio_cv_.notify_all();
+            // Make sure the complete transcript is shown (throttling may have skipped
+            // the last deltas); the bubble dedupes if it's unchanged.
+            if (!final_text.empty()) {
+                EmitTtsState("sentence_start", final_text.c_str());
+            }
             if (text_only_stop) {
                 EmitTtsState("stop");
             }
-            // The whole reply (incl. transcript) is in; tell the display it can start
-            // looping the text. response.done is the single terminal event.
+            // The whole reply is in; tell the display it can start looping the text.
+            // response.done is the single terminal event.
             if (strcmp(type->valuestring, "response.done") == 0) {
                 EmitTtsState("complete");
             }
@@ -494,20 +501,28 @@ void GptRealtimeProtocol::HandleTranscriptDelta(const cJSON* root)
         return;
     }
     // The realtime API streams the transcript in small deltas, but SetChatMessage
-    // replaces the whole bubble. Accumulate and emit the full text so far so the
-    // bubble grows like a typewriter, in sync with the streamed audio. Snapshot the
-    // accumulated text under the lock so a concurrent clear (abort/finalize) can't
-    // race the std::string while we read it.
+    // replaces the whole bubble (a full O(n) re-layout). Accumulate every delta, but
+    // only push to the display a few times per second so the rendering doesn't starve
+    // the audio tasks on long replies. The complete text is emitted once on done.
     std::string snapshot;
+    bool emit = false;
     {
         std::lock_guard<std::mutex> lock(output_audio_mutex_);
         // The transcript can start before the first audio frame; mark the response
         // active so we stop streaming mic audio into it (see SendAudio).
         response_active_ = true;
         response_transcript_ += delta->valuestring;
-        snapshot = response_transcript_;
+
+        uint32_t now = xTaskGetTickCount();
+        if (now - last_transcript_tick_ >= pdMS_TO_TICKS(kTranscriptEmitIntervalMs)) {
+            last_transcript_tick_ = now;
+            snapshot = response_transcript_;
+            emit = true;
+        }
     }
-    EmitTtsState("sentence_start", snapshot.c_str());
+    if (emit) {
+        EmitTtsState("sentence_start", snapshot.c_str());
+    }
 }
 
 void GptRealtimeProtocol::EmitTtsState(const char* state, const char* text)

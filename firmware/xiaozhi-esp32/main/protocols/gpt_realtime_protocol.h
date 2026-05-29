@@ -42,6 +42,11 @@ private:
     // the (asynchronous) switch to the speaking device state completes first and
     // the playback path stops dropping the audio.
     static constexpr int kSpeakingSettleMs = 120;
+    // Throttle transcript display updates. Re-rendering the whole growing text on
+    // every delta is O(n) per delta and, on long replies, starves the audio tasks
+    // of CPU (playback stalls until rendering settles). Accumulate every delta but
+    // push to the display at most this often; the final text is emitted on done.
+    static constexpr int kTranscriptEmitIntervalMs = 150;
 
     std::unique_ptr<WebSocket> websocket_;
     mutable std::mutex websocket_mutex_;
@@ -62,6 +67,7 @@ private:
     // audio task defers the "stop" tts event until it has played out the buffered
     // audio, so turn-taking doesn't cut playback short.
     bool response_complete_ = false;
+    uint32_t last_transcript_tick_ = 0;
     bool input_audio_appended_ = false;
     bool output_audio_task_running_ = false;
     bool output_new_response_ = false;

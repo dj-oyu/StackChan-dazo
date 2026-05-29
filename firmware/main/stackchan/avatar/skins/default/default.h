@@ -89,7 +89,6 @@ public:
 
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _container;
-    std::unique_ptr<uitk::lvgl_cpp::Image> _arrow;
     std::unique_ptr<uitk::lvgl_cpp::Container> _bubble;
     std::unique_ptr<uitk::lvgl_cpp::Label> _text;
     std::string _shown;            // last text set (reused buffer; enables dedup)
