@@ -413,8 +413,15 @@ bool StackChanCamera::EncodeToJpegDataUri(std::string& data_uri, int quality)
     {
         const uint16_t w = frame_.width ? frame_.width : 320;
         const uint16_t h = frame_.height ? frame_.height : 240;
+        // The capture buffer labelled YUYV is actually big-endian RGB565 (the same
+        // discovery that fixed the on-screen preview in Capture()). Tell the JPEG
+        // encoder it's RGB565X (big-endian RGB565) so the photo sent to the vision
+        // model has correct colors, instead of decoding RGB bytes as YUV -- which
+        // gave Grok a magenta/green image ("purple face, green outline").
+        const v4l2_pix_fmt_t enc_fmt =
+            (frame_.format == V4L2_PIX_FMT_YUYV) ? V4L2_PIX_FMT_RGB565X : frame_.format;
         bool ok = image_to_jpeg_cb(
-            frame_.data, frame_.len, w, h, frame_.format, quality,
+            frame_.data, frame_.len, w, h, enc_fmt, quality,
             [](void* arg, size_t index, const void* data, size_t len) -> size_t {
                 auto output = static_cast<std::string*>(arg);
                 if (data != nullptr && len > 0) {
@@ -1079,7 +1086,9 @@ std::string StackChanCamera::Explain(const std::string& question)
     encoder_thread_ = std::thread([this, jpeg_queue]() {
         uint16_t w             = frame_.width ? frame_.width : 320;
         uint16_t h             = frame_.height ? frame_.height : 240;
-        v4l2_pix_fmt_t enc_fmt = frame_.format;
+        // YUYV-labelled buffer is actually big-endian RGB565; encode as RGB565X so
+        // colors are correct (see EncodeToJpegDataUri for the full explanation).
+        v4l2_pix_fmt_t enc_fmt = (frame_.format == V4L2_PIX_FMT_YUYV) ? V4L2_PIX_FMT_RGB565X : frame_.format;
         bool ok                = image_to_jpeg_cb(
                            frame_.data, frame_.len, w, h, enc_fmt, 80,
                            [](void* arg, size_t index, const void* data, size_t len) -> size_t {

@@ -26,6 +26,18 @@ Verified on device with uniform color cards:
 | red     | `c1 a5`   | `0xc1a5`     | R=24 G=13 B=5  (red)   |
 | green   | `16 a2`   | `0x16a2`     | R=2  G=53 B=2  (green) |
 
+### The JPEG sent to the vision model needs the SAME fix
+
+The preview path (above) was fixed first, but the JPEG encode path
+(`EncodeToJpegDataUri` and the `Explain` encoder thread) still passed
+`frame_.format` (== `V4L2_PIX_FMT_YUYV`) to `image_to_jpeg_cb`, so the photo
+sent to Grok was decoded as YUV → a magenta/green image (Grok literally
+described a "purple face, green outline"). Fix: pass **`V4L2_PIX_FMT_RGB565X`**
+(big-endian RGB565, supported by the encoder's `esp_imgfx` path) when the frame
+is YUYV-labelled. After this Grok describes correct colors. NOTE: GC0308 still
+has a mild green/white-balance bias (the red card decodes to G=13); it's minor
+and left uncorrected per the user's "no software correction" preference.
+
 ### Dead ends (do NOT repeat)
 
 All of these were tried and are **wrong** — the data was never YUV:
@@ -60,6 +72,17 @@ The on-screen camera button (`CreateCameraButton` in `stackchan_display.cc`) is 
 48×48 icon. Its hit area is enlarged with `lv_obj_set_ext_click_area(btn, 40)`
 so it is easy to tap without changing the visual size.
 
+## Look-and-take: wait for the head to actually stop
+
+`look_and_take_photo` issues a head move (a spring animation ticked by the
+`_stackchan_update_task`), then captures. A fixed `vTaskDelay(settle_ms)` was not
+enough for large/slow turns, so the shutter fired **mid-rotation** (motion blur /
+wrong direction). Both photo paths (`hal_mcp.cpp` and
+`CaptureImageForFunctionTool` in `gpt_realtime_protocol.cc`) now **poll
+`motion.isMoving()` until the head reaches target** (capped at 4 s so a stalled
+servo can't hang the call), then apply a short post-motion `settle_ms` (default
+800 ms) for vibration / auto-exposure to settle before capturing.
+
 ## AI vision (Grok / xAI) — how it works
 
 Grok realtime voice (`wss`) can't take images, so a function tool
@@ -82,9 +105,31 @@ Key requirements (see `gpt_realtime_protocol.cc`):
   60 s timeout.
 - Use **`esp_http_client`** (cert bundle) for the POST, not the board's custom
   `HttpClient` (its TLS receive task is starved during realtime audio).
+- Encode the JPEG as **`V4L2_PIX_FMT_RGB565X`**, not the buffer's `YUYV` label
+  (see the JPEG color section above), or Grok sees a magenta/green image.
 
-### Still open (polish)
+### Grok will NOT auto-speak the photo result — by design
 
-Grok doesn't auto-speak the result immediately after the photo; the function
-output lands in context but the answer comes on the next user turn. Free SRAM
-dips to ~4.6 KB during the vision call (near OOM).
+Grok's Voice Agent **does not stream audio for a client-issued
+`response.create`**. Verified on device across four approaches, all identical:
+bare `response.create`, one with `instructions`, an injected user-text turn, and
+one with explicit `output_modalities:["audio"]` — each opened a response
+(`response.created` → `response.content_part.added`) then went **silent** (no
+audio delta, no `response.done`) until the user spoke. Only **server-VAD turns
+(real user speech)** produce audio. Muting the mic during/after the tool did not
+help, so it is not a mic-streaming race.
+
+**Fallback (current behavior):** after the tool finishes we do NOT send
+`response.create`. The visual description is in the conversation via
+`function_call_output`, so the user's **next spoken turn** ("何が見えた？") makes
+Grok describe the photo from context (correct colors). To prompt the user we
+play a chime (`OGG_NEW_NOTIFICATION`) and show a short bubble hint
+("「何が見えた？」と聞いてね"). Keep the hint ≤2 lines: the avatar speech bubble
+caps at 2 lines and only auto-scrolls overflow for *streamed* replies
+(`onSpeechComplete`), not one-shot system text, so a longer hint clips.
+
+Mic suppression (`function_active_`) is kept only **during** the tool run (so
+server-VAD can't open a competing turn mid-capture) with a 30 s failsafe in
+`SendAudio` in case the touch confirmation is never answered.
+
+Watch: free SRAM dips to ~4–7 KB during the vision call (near OOM).

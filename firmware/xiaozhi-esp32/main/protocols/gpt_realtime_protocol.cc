@@ -20,6 +20,8 @@
 #include <web_socket.h>
 #include <freertos/semphr.h>
 #include <stackchan/stackchan.h>
+#include <hal/board/hal_bridge.h>
+#include <assets/assets.h>
 #include <cstdio>
 
 #define TAG "GPT"
@@ -36,6 +38,31 @@ static void MoveStackChanHeadFromJson(int yaw, int pitch, int speed)
              R"({"yawServo":{"angle":%d,"speed":%d},"pitchServo":{"angle":%d,"speed":%d}})", yaw * 10, speed,
              pitch * 10, speed);
     GetStackChan().updateMotionFromJson(motion_json);
+}
+
+// The head move is a spring animation that keeps running on the stackchan update
+// task after MoveStackChanHeadFromJson() returns. Block until the head actually
+// reaches its target before the shutter fires (otherwise the photo is taken
+// mid-rotation), capped so a stalled servo can't hang the call, then add a short
+// post-motion settle for vibration / auto-exposure to stabilize.
+static void WaitForHeadToSettle(int extra_settle_ms)
+{
+    auto& motion = GetStackChan().motion();
+
+    const int poll_ms  = 20;
+    const int max_wait = 4000;
+    int waited         = 0;
+    vTaskDelay(pdMS_TO_TICKS(poll_ms));  // let the new animation target register first
+    waited += poll_ms;
+    while (motion.isMoving() && waited < max_wait) {
+        vTaskDelay(pdMS_TO_TICKS(poll_ms));
+        waited += poll_ms;
+    }
+    if (extra_settle_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(extra_settle_ms));
+    }
+    ESP_LOGI(TAG, "Head settled: motion_wait=%dms extra=%dms still_moving=%d", waited, extra_settle_ms,
+             static_cast<int>(motion.isMoving()));
 }
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
@@ -189,6 +216,7 @@ bool GptRealtimeProtocol::OpenAudioChannel()
         output_pcm_buffer_.clear();
         output_audio_queue_.clear();
         output_new_response_ = false;
+        function_active_ = false;
     }
     xEventGroupClearBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
 
@@ -404,11 +432,23 @@ bool GptRealtimeProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
     // server VAD + interrupt_response the device would otherwise interrupt its own
     // reply (e.g. via speaker echo).
     bool response_active;
+    bool function_active;
     {
         std::lock_guard<std::mutex> lock(output_audio_mutex_);
         response_active = response_active_;
+        function_active = function_active_;
+        // Failsafe: never keep the mic muted forever if the post-photo response
+        // never starts (e.g. a server hiccup) -- re-enable input after the cap.
+        if (function_active && (GetHAL().millis() - function_active_since_ms_) > kFunctionMicMuteMaxMs) {
+            function_active = false;
+            function_active_ = false;
+        }
     }
-    if (!IsAudioChannelOpened() || packet == nullptr || response_active) {
+    // Suppress mic while a camera tool runs AND until its follow-up response starts
+    // speaking: otherwise the resumed input stream makes Grok hold (never stream) the
+    // post-photo answer, and server-VAD speech during the ~7s capture would open a
+    // competing turn that collides with the result we inject.
+    if (!IsAudioChannelOpened() || packet == nullptr || response_active || function_active) {
         return false;
     }
 
@@ -469,6 +509,7 @@ void GptRealtimeProtocol::SendStartListening(ListeningMode mode)
         output_pcm_buffer_.clear();
         output_audio_queue_.clear();
         output_new_response_ = false;
+        function_active_ = false;
     }
     SendText("{\"type\":\"input_audio_buffer.clear\"}");
 }
@@ -501,6 +542,7 @@ void GptRealtimeProtocol::SendAbortSpeaking(AbortReason reason)
         output_pcm_buffer_.clear();
         output_audio_queue_.clear();
         output_new_response_ = false;
+        function_active_ = false;
     }
     EmitTtsState("stop");
 }
@@ -630,9 +672,9 @@ void GptRealtimeProtocol::AddStackChanFunctionTools(cJSON* session)
     cJSON_AddNumberToObject(speed, "default", 250);
     cJSON* settle_ms = cJSON_AddObjectToObject(look_props, "settle_ms");
     cJSON_AddStringToObject(settle_ms, "type", "integer");
-    cJSON_AddNumberToObject(settle_ms, "minimum", 800);
+    cJSON_AddNumberToObject(settle_ms, "minimum", 0);
     cJSON_AddNumberToObject(settle_ms, "maximum", 3000);
-    cJSON_AddNumberToObject(settle_ms, "default", 1800);
+    cJSON_AddNumberToObject(settle_ms, "default", 800);
     cJSON* look_question = cJSON_AddObjectToObject(look_props, "question");
     cJSON_AddStringToObject(look_question, "type", "string");
     cJSON_AddStringToObject(look_question, "description", "The user's visual question or request.");
@@ -860,6 +902,8 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
             {
                 std::lock_guard<std::mutex> lock(output_audio_mutex_);
                 final_text = response_transcript_;  // full text (display updates are throttled)
+                // A response finished (with or without audio): release mic suppression.
+                function_active_ = false;
                 if (response_audio_started_) {
                     response_complete_ = true;
                 } else if (response_active_ && !response_complete_) {
@@ -930,7 +974,7 @@ bool GptRealtimeProtocol::ExecuteStackChanCameraTool(const char* function_name, 
         auto question = cJSON_GetObjectItem(args, "question");
         return CaptureImageForFunctionTool(
             true, cJSON_IsNumber(yaw) ? yaw->valueint : 0, cJSON_IsNumber(pitch) ? pitch->valueint : 20,
-            cJSON_IsNumber(speed) ? speed->valueint : 250, cJSON_IsNumber(settle_ms) ? settle_ms->valueint : 1800,
+            cJSON_IsNumber(speed) ? speed->valueint : 250, cJSON_IsNumber(settle_ms) ? settle_ms->valueint : 800,
             cJSON_IsString(question) ? question->valuestring : "What is visible?", output);
     }
 
@@ -979,6 +1023,15 @@ void GptRealtimeProtocol::DispatchFunctionCall(const std::string& call_id, const
         }
     }
 
+    // Stop feeding mic audio immediately and keep it muted through the tool run and
+    // the follow-up response, so server-VAD can't open a competing turn and the input
+    // stream doesn't make Grok stall the post-photo answer (see function_active_).
+    {
+        std::lock_guard<std::mutex> lock(output_audio_mutex_);
+        function_active_ = true;
+        function_active_since_ms_ = GetHAL().millis();
+    }
+
     // The camera tool blocks on a touch OK/NG confirmation and a synchronous Grok
     // vision HTTP request. Running it inline would freeze the WebSocket receive task
     // (no more audio/events processed -> "voice stops after a photo"). Spawning a
@@ -1006,6 +1059,10 @@ void GptRealtimeProtocol::DispatchFunctionCall(const std::string& call_id, const
             output = "{\"success\":false,\"error\":\"Function failed\"}";
         }
 
+        // Drop any mic audio server-VAD buffered just before we suppressed input,
+        // so it can't fire a stray turn that races our function_call_output below.
+        SendText("{\"type\":\"input_audio_buffer.clear\"}");
+
         cJSON* response = cJSON_CreateObject();
         cJSON_AddStringToObject(response, "type", "conversation.item.create");
         cJSON* item = cJSON_AddObjectToObject(response, "item");
@@ -1016,21 +1073,48 @@ void GptRealtimeProtocol::DispatchFunctionCall(const std::string& call_id, const
         bool out_ok = SendText(json);
         cJSON_free(json);
         cJSON_Delete(response);
-        // A bare response.create after the function output produced an EMPTY response
-        // (the original tool-call turn already closed with response.done while we spent
-        // ~7s capturing). Give explicit instructions so the model actually speaks the
-        // photo result on this new turn instead of waiting for the user.
-        bool resp_ok = SendText(
-            "{\"type\":\"response.create\",\"response\":{\"instructions\":\"The camera photo result is now in the "
-            "conversation as the latest function result. Immediately tell the user, in your own spoken voice, what is "
-            "in the photo and answer their question. Do not wait for further input.\"}}");
-        ESP_LOGI(TAG, "Function output sent: call_id=%s output_ok=%d response_create_ok=%d output=%.200s",
-                 call_id.c_str(), out_ok, resp_ok, output.c_str());
+        // Auto-speak is NOT possible from the client here: Grok's Voice Agent does not
+        // stream audio for a client-issued response.create. Verified on device across
+        // four approaches (bare response.create, one with instructions, an injected user
+        // turn, and an explicit output_modalities:["audio"]) -- each opened a response,
+        // added a content part, then went silent (no audio delta, no response.done) until
+        // the user spoke. Only server-VAD (real user speech) turns produce audio. So we
+        // intentionally do NOT send response.create. The visual description is now in the
+        // conversation via function_call_output, so the user's next spoken turn makes
+        // Grok describe the photo from context. Prompt the user to ask.
+        std::string desc;
+        cJSON* parsed = cJSON_Parse(output.c_str());
+        if (parsed != nullptr) {
+            cJSON* vd = cJSON_GetObjectItem(parsed, "visual_description");
+            if (cJSON_IsString(vd)) {
+                desc = vd->valuestring;
+            }
+            cJSON_Delete(parsed);
+        }
+        // Caption is ready but Grok won't speak it on its own (see above). Prompt the
+        // user to ask, with BOTH a screen message and a notification chime so it's
+        // noticeable without watching the display.
+        // Keep this short: the avatar bubble caps at 2 lines and only auto-scrolls
+        // overflow for streamed replies (onSpeechComplete), not one-shot system text,
+        // so a 3-line hint would clip. The chime already signals "done"; the text just
+        // tells the user to ask.
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            display->SetChatMessage("system", "「何が見えた？」と聞いてね");
+        }
+        hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
+        ESP_LOGI(TAG, "Function output sent: call_id=%s output_ok=%d desc_len=%u output=%.160s",
+                 call_id.c_str(), out_ok, (unsigned)desc.size(), output.c_str());
 
         {
             std::lock_guard<std::mutex> lock(function_call_mutex_);
             function_call_names_.erase(call_id);
             // Keep dispatched_call_ids_ so a late response.done duplicate stays suppressed.
+        }
+        // Resume the mic now so the user can immediately ask about the photo.
+        {
+            std::lock_guard<std::mutex> lock(output_audio_mutex_);
+            function_active_ = false;
         }
     });
 }
@@ -1089,7 +1173,7 @@ bool GptRealtimeProtocol::CaptureImageForFunctionTool(bool move_head, int yaw, i
                      settle_ms);
             MoveStackChanHeadFromJson(yaw, pitch, speed);
         }
-        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+        WaitForHeadToSettle(settle_ms);
         motion.setModifyLock(false);
     }
 
@@ -1190,6 +1274,8 @@ void GptRealtimeProtocol::HandleAudioDelta(const cJSON* root)
             output_new_response_ = true;
             started_now = true;
         }
+        // The post-photo response is now speaking; mic suppression did its job.
+        function_active_ = false;
         output_audio_queue_.push_back(std::move(bytes));
     }
     output_audio_cv_.notify_all();

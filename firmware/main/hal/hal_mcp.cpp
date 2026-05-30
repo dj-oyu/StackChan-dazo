@@ -33,6 +33,33 @@ static void move_head_from_json(int yaw, int pitch, int speed)
     GetStackChan().updateMotionFromJson(motion_json);
 }
 
+// The head move is a spring animation that keeps running on the stackchan update
+// task (hal.cpp) after move_head_from_json() returns. Block until the head
+// actually reaches its target before the shutter fires (otherwise the photo is
+// taken mid-rotation), capped so a stalled/disconnected servo can't hang the
+// call, then add a short post-motion settle for mechanical vibration / the
+// sensor's auto-exposure to stabilize.
+static void wait_for_head_to_settle(int extra_settle_ms)
+{
+    auto& motion = GetStackChan().motion();
+
+    const int poll_ms  = 20;
+    const int max_wait = 4000;
+    int waited         = 0;
+    // Let the freshly-set animation target register before sampling isMoving().
+    vTaskDelay(pdMS_TO_TICKS(poll_ms));
+    waited += poll_ms;
+    while (motion.isMoving() && waited < max_wait) {
+        vTaskDelay(pdMS_TO_TICKS(poll_ms));
+        waited += poll_ms;
+    }
+    if (extra_settle_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(extra_settle_ms));
+    }
+    mclog::tagInfo(_tag, "head settled: motion_wait={}ms extra={}ms still_moving={}", waited, extra_settle_ms,
+                   static_cast<int>(motion.isMoving()));
+}
+
 void Hal::xiaozhi_mcp_init()
 {
     mclog::tagInfo(_tag, "init");
@@ -105,7 +132,7 @@ void Hal::xiaozhi_mcp_init()
         PropertyList({Property("yaw", kPropertyTypeInteger, 0, -128, 128),
                       Property("pitch", kPropertyTypeInteger, 20, 0, 90),
                       Property("speed", kPropertyTypeInteger, 250, 100, 1000),
-                      Property("settle_ms", kPropertyTypeInteger, 900, 300, 3000),
+                      Property("settle_ms", kPropertyTypeInteger, 800, 0, 3000),
                       Property("question", kPropertyTypeString)}),
         [this](const PropertyList& properties) -> ReturnValue {
             int yaw       = properties["yaw"].value<int>();
@@ -136,7 +163,7 @@ void Hal::xiaozhi_mcp_init()
                     move_head_from_json(yaw, pitch, speed);
                 }
 
-                vTaskDelay(pdMS_TO_TICKS(settle_ms));
+                wait_for_head_to_settle(settle_ms);
 
                 TaskPriorityReset priority_reset(1);
                 if (!camera->Capture()) {

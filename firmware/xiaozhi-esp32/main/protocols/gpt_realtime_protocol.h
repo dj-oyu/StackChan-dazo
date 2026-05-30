@@ -83,6 +83,14 @@ private:
     bool input_audio_appended_ = false;
     bool output_audio_task_running_ = false;
     bool output_new_response_ = false;
+    // True while a camera function tool is running (head move + capture + touch OK/NG
+    // + vision HTTP). Suppresses mic streaming so server-VAD can't open a competing
+    // turn during the capture. Cleared as soon as the tool finishes (function output
+    // sent). A failsafe timeout in SendAudio re-enables the mic if the tool hangs
+    // (e.g. the user never touches OK/NG) so input can never mute forever.
+    bool function_active_ = false;
+    uint32_t function_active_since_ms_ = 0;
+    static constexpr uint32_t kFunctionMicMuteMaxMs = 30000;
     uint32_t input_audio_packet_count_ = 0;
     std::map<std::string, std::string> function_call_names_;
     std::set<std::string> dispatched_call_ids_;
