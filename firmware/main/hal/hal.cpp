@@ -229,6 +229,11 @@ private:
                 }
             }
 
+            if (headbang_ <= 0.02f) {
+                reset_avatar_offset();
+                return;
+            }
+
             int dy = (int)(headbang_ * 38.0f);
             avatar.leftEye().setPosition(uitk::Vector2i(0, dy));
             avatar.rightEye().setPosition(uitk::Vector2i(0, dy));
@@ -241,8 +246,18 @@ private:
         if (!headbang_active_) {
             return;
         }
+        reset_avatar_offset(true);
+    }
+
+    void reset_avatar_offset(bool reset_phase = false)
+    {
+        if (reset_phase) {
+            headbang_k_ = -1;
+        }
+        if (!headbang_active_) {
+            return;
+        }
         headbang_active_ = false;
-        headbang_k_ = -1;
         if (GetStackChan().hasAvatar()) {
             auto& avatar = GetStackChan().avatar();
             avatar.leftEye().setPosition(uitk::Vector2i(0, 0));

@@ -259,6 +259,9 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 }
 
 void AudioService::AudioInputTask() {
+    std::vector<int16_t> input_frame;
+    input_frame.reserve(160 * codec_->input_channels());
+
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
             AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
@@ -285,11 +288,11 @@ void AudioService::AudioInputTask() {
             if (ReadAudioData(data, 16000, samples)) {
                 // If input channels is 2, we need to fetch the left channel data
                 if (codec_->input_channels() == 2) {
-                    auto mono_data = std::vector<int16_t>(data.size() / 2);
-                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
-                        mono_data[i] = data[j];
+                    size_t mono_size = data.size() / 2;
+                    for (size_t i = 0, j = 0; i < mono_size; ++i, j += 2) {
+                        data[i] = data[j];
                     }
-                    data = std::move(mono_data);
+                    data.resize(mono_size);
                 }
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToTestingQueue, std::move(data));
                 continue;
@@ -299,14 +302,13 @@ void AudioService::AudioInputTask() {
         /* Feed the wake word and/or audio processor */
         if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
             int samples = 160; // 10ms
-            std::vector<int16_t> data;
-            if (ReadAudioData(data, 16000, samples)) {
+            if (ReadAudioData(input_frame, 16000, samples)) {
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
-                    wake_word_->Feed(data);
-                    MaybeEmitSpectrum(data);  // [TEMP DIAG] idle music survey
+                    wake_word_->Feed(input_frame);
+                    MaybeEmitSpectrum(input_frame);  // [TEMP DIAG] idle music survey
                 }
                 if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
-                    audio_processor_->Feed(std::move(data));
+                    audio_processor_->Feed(std::move(input_frame));
                 }
                 continue;
             }
