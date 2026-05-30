@@ -7,8 +7,10 @@
 #include <freertos/event_groups.h>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,6 +39,8 @@ public:
     void SendAbortSpeaking(AbortReason reason) override;
     void SendWakeWordDetected(const std::string& wake_word) override;
     void SendMcpMessage(const std::string& message) override;
+    bool SupportsImageAttachment() const override;
+    bool SendImageMessage(const std::string& data_uri, const std::string& text = "") override;
 
 protected:
     bool SendText(const std::string& text) override;
@@ -80,12 +84,18 @@ private:
     bool output_audio_task_running_ = false;
     bool output_new_response_ = false;
     uint32_t input_audio_packet_count_ = 0;
+    std::map<std::string, std::string> function_call_names_;
+    std::set<std::string> dispatched_call_ids_;
+    std::mutex function_call_mutex_;
     RealtimeProvider provider_ = RealtimeProvider::OpenAi;
     std::string api_key_;
     std::string model_;
     std::string voice_;
     std::string instructions_;
     std::string url_;
+    std::string vision_model_;
+    std::string vision_detail_;
+    int vision_max_output_tokens_ = 160;
     // Grok server-VAD tuning (NVS-overridable in the "grok" namespace). Defaults
     // match xAI's documented defaults; OpenAI uses its own fixed values above.
     // Threshold is stored as an integer percent (85 -> 0.85) since NVS has no float.
@@ -103,10 +113,22 @@ private:
     bool EnsureCodecs();
     bool SendSessionUpdate();
     bool SendGrokSessionUpdate();
+    void AddStackChanFunctionTools(cJSON* session);
     void HandleTextMessage(const char* data, size_t len);
+    void RememberFunctionCallName(const cJSON* root);
+    void HandleFunctionCall(const cJSON* root);
+    bool HandleFunctionCallsFromResponseDone(const cJSON* root);
+    void DispatchFunctionCall(const std::string& call_id, const std::string& function_name,
+                              const std::string& arguments_json);
     void HandleAudioDelta(const cJSON* root);
     void HandleTranscriptDelta(const cJSON* root);
     void EmitTtsState(const char* state, const char* text = nullptr);
+    bool SendUserTextItem(const std::string& text, bool create_response);
+    bool ExecuteStackChanCameraTool(const char* name, const cJSON* args, std::string& output);
+    bool CaptureImageForFunctionTool(bool move_head, int yaw, int pitch, int speed, int settle_ms,
+                                     const std::string& question, std::string& output);
+    bool DescribeImageWithGrok(const std::string& data_uri, std::string& description);
+    std::string ExtractTextFromJson(const cJSON* root) const;
     void StartOutputAudioTask();
     void StopOutputAudioTask();
     void OutputAudioTask();

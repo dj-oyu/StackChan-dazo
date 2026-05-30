@@ -8,10 +8,30 @@
 #include <mcp_server.h>
 #include <stackchan/stackchan.h>
 #include <apps/common/common.h>
+#include <application.h>
+#include <board.h>
+#include <lvgl_display.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <cstdio>
 
 using namespace stackchan;
 
 static const std::string_view _tag = "HAL-MCP";
+
+static void move_head_from_json(int yaw, int pitch, int speed)
+{
+    auto& motion = GetStackChan().motion();
+    GetHAL().setServoPowerEnabled(true);
+    motion.setTorqueEnabled(true);
+    motion.setAutoAngleSyncEnabled(true);
+
+    char motion_json[128];
+    snprintf(motion_json, sizeof(motion_json),
+             R"({"yawServo":{"angle":%d,"speed":%d},"pitchServo":{"angle":%d,"speed":%d}})", yaw * 10, speed,
+             pitch * 10, speed);
+    GetStackChan().updateMotionFromJson(motion_json);
+}
 
 void Hal::xiaozhi_mcp_init()
 {
@@ -59,6 +79,9 @@ void Hal::xiaozhi_mcp_init()
                            LvglLockGuard lock;
 
                            auto& motion = GetStackChan().motion();
+                           GetHAL().setServoPowerEnabled(true);
+                           motion.setTorqueEnabled(true);
+                           motion.setAutoAngleSyncEnabled(true);
                            if (pitch != -9999) {
                                motion.pitchServo().moveWithSpeed(pitch * 10, speed);
                            }
@@ -68,6 +91,83 @@ void Hal::xiaozhi_mcp_init()
 
                            return true;
                        });
+
+    mclog::tagInfo(_tag, "add camera.look_and_take_photo tool");
+    mcp_server.AddTool(
+        "self.camera.look_and_take_photo",
+        "Turn Stack-chan's head toward a requested direction, wait for the camera to settle, then take a photo. "
+        "Use this when the user asks Stack-chan to look somewhere and see/take a look, for example Japanese phrases "
+        "like `右斜め上あたりを見てみて`, `真後ろを見てみて`, or `90度左を見てみて`. "
+        "Yaw is degrees: negative is Stack-chan's left, positive is Stack-chan's right. "
+        "Pitch is degrees: 0 is low/forward, 45 is diagonal up, 90 is max up. "
+        "Examples: right-up -> yaw=45,pitch=45; directly behind -> yaw=128,pitch=20; 90 degrees left -> yaw=-90,pitch=20. "
+        "This tool always shows the captured image on the touch display and waits for the user's OK/NG confirmation before upload.",
+        PropertyList({Property("yaw", kPropertyTypeInteger, 0, -128, 128),
+                      Property("pitch", kPropertyTypeInteger, 20, 0, 90),
+                      Property("speed", kPropertyTypeInteger, 250, 100, 1000),
+                      Property("settle_ms", kPropertyTypeInteger, 900, 300, 3000),
+                      Property("question", kPropertyTypeString)}),
+        [this](const PropertyList& properties) -> ReturnValue {
+            int yaw       = properties["yaw"].value<int>();
+            int pitch     = properties["pitch"].value<int>();
+            int speed     = properties["speed"].value<int>();
+            int settle_ms = properties["settle_ms"].value<int>();
+            auto question = properties["question"].value<std::string>();
+
+            mclog::tagInfo(_tag, "look_and_take_photo: yaw={}, pitch={}, speed={}, settle_ms={}, question={}", yaw,
+                           pitch, speed, settle_ms, question);
+
+            auto& board = Board::GetInstance();
+            auto camera = board.GetCamera();
+            auto display = dynamic_cast<LvglDisplay*>(board.GetDisplay());
+            if (camera == nullptr) {
+                throw std::runtime_error("Camera is unavailable");
+            }
+            if (display == nullptr) {
+                throw std::runtime_error("Photo review screen is unavailable");
+            }
+
+            auto& motion = GetStackChan().motion();
+            motion.setModifyLock(true);
+            setServoPowerEnabled(true);
+            try {
+                {
+                    LvglLockGuard lock;
+                    move_head_from_json(yaw, pitch, speed);
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(settle_ms));
+
+                TaskPriorityReset priority_reset(1);
+                if (!camera->Capture()) {
+                    throw std::runtime_error("Failed to capture photo");
+                }
+
+                bool accepted = false;
+                SemaphoreHandle_t done = xSemaphoreCreateBinary();
+                if (done == nullptr) {
+                    throw std::runtime_error("Failed to create photo review semaphore");
+                }
+                display->ShowImageConfirmation([done, &accepted](bool ok) {
+                    accepted = ok;
+                    xSemaphoreGive(done);
+                });
+                xSemaphoreTake(done, portMAX_DELAY);
+                vSemaphoreDelete(done);
+                if (!accepted) {
+                    throw std::runtime_error("User rejected the photo");
+                }
+
+                auto result = camera->Explain(question);
+                display->SetPreviewImage(nullptr);
+                motion.setModifyLock(false);
+                return result;
+            } catch (...) {
+                display->SetPreviewImage(nullptr);
+                motion.setModifyLock(false);
+                throw;
+            }
+        });
 
     mclog::tagInfo(_tag, "add robot.set_led_color tool");
     mcp_server.AddTool(

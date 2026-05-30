@@ -82,6 +82,8 @@ public:
     virtual void SendStopListening();
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual void SendMcpMessage(const std::string& message);
+    virtual bool SupportsImageAttachment() const { return false; }
+    virtual bool SendImageMessage(const std::string& data_uri, const std::string& text = "") { return false; }
 
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;

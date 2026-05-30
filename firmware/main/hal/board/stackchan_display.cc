@@ -17,6 +17,7 @@
 #include <stackchan/stackchan.h>
 #include <assets/lang_config.h>
 #include <hal/hal.h>
+#include <application.h>
 
 using namespace stackchan;
 using namespace stackchan::avatar;
@@ -206,6 +207,12 @@ StackChanAvatarDisplay::~StackChanAvatarDisplay()
     if (preview_image_ != nullptr) {
         lv_obj_del(preview_image_);
     }
+    if (camera_button_ != nullptr) {
+        lv_obj_del(camera_button_);
+    }
+    if (image_confirm_panel_ != nullptr) {
+        lv_obj_del(image_confirm_panel_);
+    }
 
     auto& stackchan = GetStackChan();
     if (stackchan.hasAvatar()) {
@@ -270,12 +277,84 @@ void StackChanAvatarDisplay::SetupUI()
     lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
+    CreateCameraButton();
+
     // GetHAL().startStackChanAutoUpdate(24);
 
     auto config        = hal_bridge::get_xiaozhi_config();
     idle_motion_level_ = config.idleRandomMovementLevel;
 
     ESP_LOGI(TAG, "Avatar created and started");
+}
+
+void StackChanAvatarDisplay::CreateCameraButton()
+{
+    if (camera_button_ != nullptr) {
+        RefreshCameraButton();
+        return;
+    }
+
+    camera_button_ = lv_btn_create(lv_screen_active());
+    lv_obj_set_size(camera_button_, 48, 48);
+    lv_obj_align(camera_button_, LV_ALIGN_TOP_RIGHT, -8, 8);
+    // Enlarge the touch/hit area well beyond the 48x48 icon so it is easy to tap.
+    lv_obj_set_ext_click_area(camera_button_, 40);
+    lv_obj_add_flag(camera_button_, LV_OBJ_FLAG_FLOATING);
+    lv_obj_remove_flag(camera_button_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(camera_button_, 24, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(camera_button_, lv_color_hex(0x111111), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(camera_button_, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_border_width(camera_button_, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(camera_button_, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(camera_button_, 0, LV_PART_MAIN);
+
+    lv_obj_t* camera_body = lv_obj_create(camera_button_);
+    lv_obj_remove_style_all(camera_body);
+    lv_obj_set_size(camera_body, 26, 18);
+    lv_obj_align(camera_body, LV_ALIGN_CENTER, 0, 2);
+    lv_obj_set_style_radius(camera_body, 4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(camera_body, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(camera_body, LV_OPA_COVER, LV_PART_MAIN);
+
+    lv_obj_t* camera_top = lv_obj_create(camera_button_);
+    lv_obj_remove_style_all(camera_top);
+    lv_obj_set_size(camera_top, 10, 5);
+    lv_obj_align_to(camera_top, camera_body, LV_ALIGN_OUT_TOP_LEFT, 4, 2);
+    lv_obj_set_style_radius(camera_top, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(camera_top, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(camera_top, LV_OPA_COVER, LV_PART_MAIN);
+
+    lv_obj_t* lens = lv_obj_create(camera_button_);
+    lv_obj_remove_style_all(lens);
+    lv_obj_set_size(lens, 10, 10);
+    lv_obj_align(lens, LV_ALIGN_CENTER, 0, 2);
+    lv_obj_set_style_radius(lens, 5, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lens, lv_color_hex(0x111111), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lens, LV_OPA_COVER, LV_PART_MAIN);
+
+    lv_obj_add_event_cb(
+        camera_button_,
+        [](lv_event_t* e) {
+            (void)e;
+            Application::GetInstance().RequestCameraAttachment();
+        },
+        LV_EVENT_CLICKED, nullptr);
+
+    RefreshCameraButton();
+}
+
+void StackChanAvatarDisplay::RefreshCameraButton()
+{
+    if (camera_button_ == nullptr) {
+        return;
+    }
+
+    if (camera_button_visible_ && image_confirm_panel_ == nullptr) {
+        lv_obj_remove_flag(camera_button_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(camera_button_);
+    } else {
+        lv_obj_add_flag(camera_button_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void StackChanAvatarDisplay::LvglLock()
@@ -446,6 +525,109 @@ void StackChanAvatarDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image)
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, 6000 * 1000));
 }
 
+void StackChanAvatarDisplay::SetCameraButtonVisible(bool visible)
+{
+    DisplayLockGuard lock(this);
+    camera_button_visible_ = visible;
+    if (camera_button_ == nullptr && setup_ui_called_) {
+        CreateCameraButton();
+    }
+    RefreshCameraButton();
+}
+
+void StackChanAvatarDisplay::ShowImageConfirmation(std::function<void(bool accepted)> callback)
+{
+    DisplayLockGuard lock(this);
+    if (preview_image_ == nullptr || preview_image_cached_ == nullptr || lv_obj_has_flag(preview_image_, LV_OBJ_FLAG_HIDDEN)) {
+        if (callback) {
+            callback(false);
+        }
+        return;
+    }
+
+    image_confirm_callback_ = std::move(callback);
+    esp_timer_stop(preview_timer_);
+    lv_obj_move_foreground(preview_image_);
+
+    if (camera_button_ != nullptr) {
+        lv_obj_add_flag(camera_button_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (image_confirm_panel_ != nullptr) {
+        lv_obj_del(image_confirm_panel_);
+        image_confirm_panel_ = nullptr;
+    }
+
+    image_confirm_panel_ = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(image_confirm_panel_);
+    lv_obj_set_size(image_confirm_panel_, width_, height_);
+    lv_obj_align(image_confirm_panel_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(image_confirm_panel_, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(image_confirm_panel_, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_move_foreground(image_confirm_panel_);
+
+    lv_obj_t* prompt = lv_label_create(image_confirm_panel_);
+    lv_label_set_text(prompt, "Attach this photo?");
+    lv_obj_set_style_text_color(prompt, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(prompt, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(prompt, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(prompt, 6, LV_PART_MAIN);
+    lv_obj_align(prompt, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t* reject = lv_btn_create(image_confirm_panel_);
+    lv_obj_set_size(reject, 74, 46);
+    lv_obj_align(reject, LV_ALIGN_BOTTOM_LEFT, 18, -12);
+    lv_obj_set_style_bg_color(reject, lv_color_hex(0xB00020), LV_PART_MAIN);
+    lv_obj_t* reject_label = lv_label_create(reject);
+    lv_label_set_text(reject_label, "NG");
+    lv_obj_center(reject_label);
+    lv_obj_add_event_cb(
+        reject,
+        [](lv_event_t* e) {
+            auto self = static_cast<StackChanAvatarDisplay*>(lv_event_get_user_data(e));
+            self->CloseImageConfirmation(false);
+        },
+        LV_EVENT_CLICKED, this);
+
+    lv_obj_t* accept = lv_btn_create(image_confirm_panel_);
+    lv_obj_set_size(accept, 74, 46);
+    lv_obj_align(accept, LV_ALIGN_BOTTOM_RIGHT, -18, -12);
+    lv_obj_set_style_bg_color(accept, lv_color_hex(0x117A37), LV_PART_MAIN);
+    lv_obj_t* accept_label = lv_label_create(accept);
+    lv_label_set_text(accept_label, "OK");
+    lv_obj_center(accept_label);
+    lv_obj_add_event_cb(
+        accept,
+        [](lv_event_t* e) {
+            auto self = static_cast<StackChanAvatarDisplay*>(lv_event_get_user_data(e));
+            self->CloseImageConfirmation(true);
+        },
+        LV_EVENT_CLICKED, this);
+}
+
+void StackChanAvatarDisplay::CloseImageConfirmation(bool accepted)
+{
+    std::function<void(bool)> callback;
+    callback = std::move(image_confirm_callback_);
+    image_confirm_callback_ = nullptr;
+
+    if (image_confirm_panel_ != nullptr) {
+        lv_obj_del(image_confirm_panel_);
+        image_confirm_panel_ = nullptr;
+    }
+    if (camera_button_ != nullptr) {
+        RefreshCameraButton();
+    }
+    if (!accepted) {
+        esp_timer_stop(preview_timer_);
+        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        preview_image_cached_.reset();
+    }
+    if (callback) {
+        callback(accepted);
+    }
+}
+
 void StackChanAvatarDisplay::UpdateStatusBar(bool update_all)
 {
 }
@@ -569,6 +751,8 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
     if (is_sleeping_) {
         avatar.setSpeech("");
     }
+
+    RefreshCameraButton();
 }
 
 void StackChanAvatarDisplay::ShowNotification(const char* notification, int duration_ms)

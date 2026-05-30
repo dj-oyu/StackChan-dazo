@@ -5,15 +5,38 @@
 #include "settings.h"
 #include "system_info.h"
 #include "assets/lang_config.h"
+#include "application.h"
+#include "display.h"
+#include "lvgl_display.h"
+#include <hal/hal.h>
 
 #include <algorithm>
 #include <cstring>
 #include <cJSON.h>
 #include <esp_log.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
 #include <mbedtls/base64.h>
 #include <web_socket.h>
+#include <freertos/semphr.h>
+#include <stackchan/stackchan.h>
+#include <cstdio>
 
 #define TAG "GPT"
+
+static void MoveStackChanHeadFromJson(int yaw, int pitch, int speed)
+{
+    auto& motion = GetStackChan().motion();
+    GetHAL().setServoPowerEnabled(true);
+    motion.setTorqueEnabled(true);
+    motion.setAutoAngleSyncEnabled(true);
+
+    char motion_json[128];
+    snprintf(motion_json, sizeof(motion_json),
+             R"({"yawServo":{"angle":%d,"speed":%d},"pitchServo":{"angle":%d,"speed":%d}})", yaw * 10, speed,
+             pitch * 10, speed);
+    GetStackChan().updateMotionFromJson(motion_json);
+}
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -82,6 +105,9 @@ void GptRealtimeProtocol::LoadSettings()
         model_ = settings.GetString("model", CONFIG_GROK_VOICE_MODEL);
         voice_ = settings.GetString("voice", CONFIG_GROK_VOICE);
         instructions_ = settings.GetString("instructions", CONFIG_GROK_INSTRUCTIONS);
+        vision_model_ = settings.GetString("vision_model", "grok-4.3");
+        vision_detail_ = settings.GetString("vision_detail", "low");
+        vision_max_output_tokens_ = settings.GetInt("vision_max_output_tokens", 160);
         url_ = settings.GetString("url", "");
         if (url_.empty()) {
             url_ = "wss://api.x.ai/v1/realtime?model=" + model_;
@@ -280,7 +306,16 @@ bool GptRealtimeProtocol::SendSessionUpdate()
     cJSON* session = cJSON_AddObjectToObject(root, "session");
     cJSON_AddStringToObject(session, "type", "realtime");
     cJSON_AddStringToObject(session, "model", model_.c_str());
-    cJSON_AddStringToObject(session, "instructions", instructions_.c_str());
+    std::string instructions = instructions_;
+    instructions +=
+        "\n\nYou are running inside a physical Stack-chan robot with a camera and head servos. "
+        "When the user asks what you can see, asks to take a photo, or asks you to look in a direction, "
+        "use the provided camera/head function tool instead of saying you do not have camera capability. "
+        "Examples: `何か見える？` -> use stackchan_take_photo; "
+        "`右斜め上を見てみて` -> use stackchan_look_and_take_photo with yaw 45 and pitch 45; "
+        "`真後ろを見てみて` -> yaw 128; `90度左を見てみて` -> yaw -90. "
+        "The device will always show the captured image to the user and wait for OK/NG before you receive the visual result.";
+    cJSON_AddStringToObject(session, "instructions", instructions.c_str());
 
     cJSON* output_modalities = cJSON_AddArrayToObject(session, "output_modalities");
     cJSON_AddItemToArray(output_modalities, cJSON_CreateString("audio"));
@@ -305,6 +340,8 @@ bool GptRealtimeProtocol::SendSessionUpdate()
     cJSON_AddNumberToObject(output_format, "rate", kOutputSampleRate);
     cJSON_AddStringToObject(output, "voice", voice_.c_str());
 
+    AddStackChanFunctionTools(session);
+
     char* json = cJSON_PrintUnformatted(root);
     std::string message(json);
     cJSON_free(json);
@@ -323,7 +360,16 @@ bool GptRealtimeProtocol::SendGrokSessionUpdate()
 
     cJSON* session = cJSON_AddObjectToObject(root, "session");
     cJSON_AddStringToObject(session, "voice", voice_.c_str());
-    cJSON_AddStringToObject(session, "instructions", instructions_.c_str());
+    std::string instructions = instructions_;
+    instructions +=
+        "\n\nYou are running inside a physical Stack-chan robot with a camera and head servos. "
+        "When the user asks what you can see, asks to take a photo, or asks you to look in a direction, "
+        "use the provided camera/head function tool instead of saying you do not have camera capability. "
+        "Examples: `何か見える？` -> use stackchan_take_photo; "
+        "`右斜め上を見てみて` -> use stackchan_look_and_take_photo with yaw 45 and pitch 45; "
+        "`真後ろを見てみて` -> yaw 128; `90度左を見てみて` -> yaw -90. "
+        "The device will always show the captured image to the user and wait for OK/NG before you receive the visual description.";
+    cJSON_AddStringToObject(session, "instructions", instructions.c_str());
 
     cJSON* turn_detection = cJSON_AddObjectToObject(session, "turn_detection");
     cJSON_AddStringToObject(turn_detection, "type", "server_vad");
@@ -341,6 +387,8 @@ bool GptRealtimeProtocol::SendGrokSessionUpdate()
     cJSON* output_format = cJSON_AddObjectToObject(output, "format");
     cJSON_AddStringToObject(output_format, "type", "audio/pcm");
     cJSON_AddNumberToObject(output_format, "rate", kOutputSampleRate);
+
+    AddStackChanFunctionTools(session);
 
     char* json = cJSON_PrintUnformatted(root);
     std::string message(json);
@@ -464,6 +512,11 @@ void GptRealtimeProtocol::SendWakeWordDetected(const std::string& wake_word)
 
 void GptRealtimeProtocol::SendMcpMessage(const std::string& message)
 {
+    SendUserTextItem(message, true);
+}
+
+bool GptRealtimeProtocol::SendUserTextItem(const std::string& text, bool create_response)
+{
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "conversation.item.create");
     cJSON* item = cJSON_AddObjectToObject(root, "item");
@@ -472,13 +525,298 @@ void GptRealtimeProtocol::SendMcpMessage(const std::string& message)
     cJSON* content = cJSON_AddArrayToObject(item, "content");
     cJSON* part = cJSON_CreateObject();
     cJSON_AddStringToObject(part, "type", "input_text");
-    cJSON_AddStringToObject(part, "text", message.c_str());
+    cJSON_AddStringToObject(part, "text", text.c_str());
     cJSON_AddItemToArray(content, part);
     char* json = cJSON_PrintUnformatted(root);
-    SendText(json);
+    bool ok = SendText(json);
     cJSON_free(json);
     cJSON_Delete(root);
-    SendText("{\"type\":\"response.create\"}");
+    if (ok && create_response) {
+        ok = SendText("{\"type\":\"response.create\"}");
+    }
+    return ok;
+}
+
+bool GptRealtimeProtocol::SupportsImageAttachment() const
+{
+    return true;
+}
+
+bool GptRealtimeProtocol::SendImageMessage(const std::string& data_uri, const std::string& text)
+{
+    if (provider_ == RealtimeProvider::Grok) {
+        std::string description;
+        if (!DescribeImageWithGrok(data_uri, description)) {
+            return false;
+        }
+
+        std::string injected_text = text.empty() ? "The user approved and attached a camera photo." : text;
+        injected_text += "\n\nVisual description from Grok image understanding:\n";
+        injected_text += description;
+        return SendUserTextItem(injected_text, false);
+    }
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "conversation.item.create");
+    cJSON* item = cJSON_AddObjectToObject(root, "item");
+    cJSON_AddStringToObject(item, "type", "message");
+    cJSON_AddStringToObject(item, "role", "user");
+    cJSON* content = cJSON_AddArrayToObject(item, "content");
+
+    if (!text.empty()) {
+        cJSON* text_part = cJSON_CreateObject();
+        cJSON_AddStringToObject(text_part, "type", "input_text");
+        cJSON_AddStringToObject(text_part, "text", text.c_str());
+        cJSON_AddItemToArray(content, text_part);
+    }
+
+    cJSON* image_part = cJSON_CreateObject();
+    cJSON_AddStringToObject(image_part, "type", "input_image");
+    cJSON_AddStringToObject(image_part, "image_url", data_uri.c_str());
+    cJSON_AddStringToObject(image_part, "detail", "auto");
+    cJSON_AddItemToArray(content, image_part);
+
+    char* json = cJSON_PrintUnformatted(root);
+    std::string message(json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return SendText(message);
+}
+
+void GptRealtimeProtocol::AddStackChanFunctionTools(cJSON* session)
+{
+    cJSON* tools = cJSON_AddArrayToObject(session, "tools");
+
+    cJSON* take_photo = cJSON_CreateObject();
+    cJSON_AddStringToObject(take_photo, "type", "function");
+    cJSON_AddStringToObject(take_photo, "name", "stackchan_take_photo");
+    cJSON_AddStringToObject(
+        take_photo, "description",
+        "Take a camera photo with mandatory touch-display OK/NG user confirmation, then return a concise visual description. "
+        "Use this whenever the user asks what Stack-chan can see, asks to look around, or asks to take a photo.");
+    cJSON* take_params = cJSON_AddObjectToObject(take_photo, "parameters");
+    cJSON_AddStringToObject(take_params, "type", "object");
+    cJSON* take_props = cJSON_AddObjectToObject(take_params, "properties");
+    cJSON* take_question = cJSON_AddObjectToObject(take_props, "question");
+    cJSON_AddStringToObject(take_question, "type", "string");
+    cJSON_AddStringToObject(take_question, "description", "The user's visual question or request.");
+    cJSON* take_required = cJSON_AddArrayToObject(take_params, "required");
+    cJSON_AddItemToArray(take_required, cJSON_CreateString("question"));
+    cJSON_AddItemToArray(tools, take_photo);
+
+    cJSON* look_photo = cJSON_CreateObject();
+    cJSON_AddStringToObject(look_photo, "type", "function");
+    cJSON_AddStringToObject(look_photo, "name", "stackchan_look_and_take_photo");
+    cJSON_AddStringToObject(
+        look_photo, "description",
+        "Turn Stack-chan's head to a direction, wait briefly, then take a confirmed camera photo and return a visual description. "
+        "Yaw degrees: negative is Stack-chan's left, positive is right. Pitch degrees: 0 forward/low, 45 diagonal up, 90 max up. "
+        "Examples: right-up yaw=45 pitch=45; directly behind yaw=128 pitch=20; 90 degrees left yaw=-90 pitch=20.");
+    cJSON* look_params = cJSON_AddObjectToObject(look_photo, "parameters");
+    cJSON_AddStringToObject(look_params, "type", "object");
+    cJSON* look_props = cJSON_AddObjectToObject(look_params, "properties");
+    cJSON* yaw = cJSON_AddObjectToObject(look_props, "yaw");
+    cJSON_AddStringToObject(yaw, "type", "integer");
+    cJSON_AddNumberToObject(yaw, "minimum", -128);
+    cJSON_AddNumberToObject(yaw, "maximum", 128);
+    cJSON* pitch = cJSON_AddObjectToObject(look_props, "pitch");
+    cJSON_AddStringToObject(pitch, "type", "integer");
+    cJSON_AddNumberToObject(pitch, "minimum", 0);
+    cJSON_AddNumberToObject(pitch, "maximum", 90);
+    cJSON* speed = cJSON_AddObjectToObject(look_props, "speed");
+    cJSON_AddStringToObject(speed, "type", "integer");
+    cJSON_AddNumberToObject(speed, "minimum", 100);
+    cJSON_AddNumberToObject(speed, "maximum", 1000);
+    cJSON_AddNumberToObject(speed, "default", 250);
+    cJSON* settle_ms = cJSON_AddObjectToObject(look_props, "settle_ms");
+    cJSON_AddStringToObject(settle_ms, "type", "integer");
+    cJSON_AddNumberToObject(settle_ms, "minimum", 800);
+    cJSON_AddNumberToObject(settle_ms, "maximum", 3000);
+    cJSON_AddNumberToObject(settle_ms, "default", 1800);
+    cJSON* look_question = cJSON_AddObjectToObject(look_props, "question");
+    cJSON_AddStringToObject(look_question, "type", "string");
+    cJSON_AddStringToObject(look_question, "description", "The user's visual question or request.");
+    cJSON* look_required = cJSON_AddArrayToObject(look_params, "required");
+    cJSON_AddItemToArray(look_required, cJSON_CreateString("yaw"));
+    cJSON_AddItemToArray(look_required, cJSON_CreateString("pitch"));
+    cJSON_AddItemToArray(look_required, cJSON_CreateString("question"));
+    cJSON_AddItemToArray(tools, look_photo);
+}
+
+bool GptRealtimeProtocol::DescribeImageWithGrok(const std::string& data_uri, std::string& description)
+{
+    description.clear();
+    if (api_key_.empty() || vision_model_.empty()) {
+        LoadSettings();
+    }
+    if (api_key_.empty()) {
+        SetError("Grok API key is not configured");
+        return false;
+    }
+
+    // xAI image understanding via the OpenAI-compatible Chat Completions endpoint
+    // (messages[].content[] with type "text" and type "image_url"). The Responses API
+    // (/v1/responses with input_image) was accepted at the TLS layer but never returned
+    // headers (60s timeout), so use the broadly-supported chat/completions shape.
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "model", vision_model_.c_str());
+    cJSON_AddNumberToObject(root, "max_completion_tokens", vision_max_output_tokens_);
+    // grok-4.3 defaults to "low" reasoning, which spends many uncapped reasoning tokens
+    // before any visible output -> the request never returned headers in 60s. A photo
+    // description needs no reasoning, so disable it for a fast response.
+    cJSON_AddStringToObject(root, "reasoning_effort", "none");
+    cJSON* messages = cJSON_AddArrayToObject(root, "messages");
+    cJSON* message = cJSON_CreateObject();
+    cJSON_AddStringToObject(message, "role", "user");
+    cJSON* content = cJSON_AddArrayToObject(message, "content");
+
+    cJSON* prompt = cJSON_CreateObject();
+    cJSON_AddStringToObject(prompt, "type", "text");
+    cJSON_AddStringToObject(prompt, "text",
+                            "Describe this camera photo concisely and objectively for a voice agent. "
+                            "Include visible objects, people, text, and spatial context. Do not answer the user yet.");
+    cJSON_AddItemToArray(content, prompt);
+
+    cJSON* image = cJSON_CreateObject();
+    cJSON_AddStringToObject(image, "type", "image_url");
+    cJSON* image_url = cJSON_AddObjectToObject(image, "image_url");
+    cJSON_AddStringToObject(image_url, "url", data_uri.c_str());
+    cJSON_AddStringToObject(image_url, "detail", vision_detail_.c_str());
+    cJSON_AddItemToArray(content, image);
+
+    cJSON_AddItemToArray(messages, message);
+
+    char* json = cJSON_PrintUnformatted(root);
+    std::string body(json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "Requesting Grok vision: model=%s detail=%s body=%u bytes (data_uri=%u)", vision_model_.c_str(),
+             vision_detail_.c_str(), (unsigned)body.size(), (unsigned)data_uri.size());
+
+    // Use ESP-IDF's esp_http_client (blocking I/O on this task) instead of the board's
+    // custom HttpClient: the latter's TLS POST to api.x.ai never received a response
+    // (its low-priority receive task is starved while realtime audio runs), so the
+    // request always hit the 60s timeout even though the endpoint replies in <1s.
+    std::string response;
+    int status_code = 0;
+    {
+        esp_http_client_config_t config = {};
+        config.url = "https://api.x.ai/v1/chat/completions";
+        config.method = HTTP_METHOD_POST;
+        config.timeout_ms = 60000;
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.buffer_size = 1536;
+        config.buffer_size_tx = 1536;
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client == nullptr) {
+            ESP_LOGE(TAG, "Failed to init Grok vision HTTP client");
+            return false;
+        }
+        std::string auth = "Bearer " + api_key_;
+        esp_http_client_set_header(client, "Authorization", auth.c_str());
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+
+        esp_err_t err = esp_http_client_open(client, body.size());
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Grok vision open failed: %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            return false;
+        }
+        size_t sent = 0;
+        bool write_ok = true;
+        while (sent < body.size()) {
+            int wlen = esp_http_client_write(client, body.data() + sent, body.size() - sent);
+            if (wlen <= 0) {
+                write_ok = false;
+                break;
+            }
+            sent += wlen;
+        }
+        if (!write_ok) {
+            ESP_LOGE(TAG, "Grok vision write failed after %u/%u bytes", (unsigned)sent, (unsigned)body.size());
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return false;
+        }
+        esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+        char buf[512];
+        int rd;
+        while ((rd = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+            response.append(buf, rd);
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+
+    ESP_LOGI(TAG, "Grok vision response: status=%d len=%u body=%.400s", status_code, (unsigned)response.size(),
+             response.c_str());
+    if (status_code < 200 || status_code >= 300) {
+        ESP_LOGE(TAG, "Grok image understanding failed, status=%d, body=%s", status_code, response.c_str());
+        return false;
+    }
+
+    cJSON* response_json = cJSON_Parse(response.c_str());
+    if (response_json == nullptr) {
+        ESP_LOGE(TAG, "Failed to parse Grok image understanding response");
+        return false;
+    }
+    // Chat Completions: choices[0].message.content (string).
+    cJSON* choices = cJSON_GetObjectItem(response_json, "choices");
+    if (cJSON_IsArray(choices)) {
+        cJSON* first = cJSON_GetArrayItem(choices, 0);
+        cJSON* msg = first ? cJSON_GetObjectItem(first, "message") : nullptr;
+        cJSON* msg_content = msg ? cJSON_GetObjectItem(msg, "content") : nullptr;
+        if (cJSON_IsString(msg_content)) {
+            description = msg_content->valuestring;
+        }
+    }
+    if (description.empty()) {
+        description = ExtractTextFromJson(response_json);
+    }
+    cJSON_Delete(response_json);
+    if (description.empty()) {
+        ESP_LOGE(TAG, "Grok image understanding response had no text");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Grok image description: %s", description.c_str());
+    return true;
+}
+
+std::string GptRealtimeProtocol::ExtractTextFromJson(const cJSON* root) const
+{
+    if (root == nullptr) {
+        return {};
+    }
+    if (cJSON_IsObject(root)) {
+        auto type = cJSON_GetObjectItem(root, "type");
+        auto text = cJSON_GetObjectItem(root, "text");
+        if (cJSON_IsString(text) &&
+            (!cJSON_IsString(type) || strcmp(type->valuestring, "output_text") == 0 ||
+             strcmp(type->valuestring, "text") == 0)) {
+            return text->valuestring;
+        }
+        auto output_text = cJSON_GetObjectItem(root, "output_text");
+        if (cJSON_IsString(output_text)) {
+            return output_text->valuestring;
+        }
+        for (auto child = root->child; child != nullptr; child = child->next) {
+            auto found = ExtractTextFromJson(child);
+            if (!found.empty()) {
+                return found;
+            }
+        }
+    } else if (cJSON_IsArray(root)) {
+        for (auto child = root->child; child != nullptr; child = child->next) {
+            auto found = ExtractTextFromJson(child);
+            if (!found.empty()) {
+                return found;
+            }
+        }
+    }
+    return {};
 }
 
 void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
@@ -493,14 +831,26 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
     auto type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type)) {
         ESP_LOGD(TAG, "Realtime event: %s", type->valuestring);
+        if (strstr(type->valuestring, ".delta") == nullptr) {
+            ESP_LOGI(TAG, "Realtime event: %s", type->valuestring);  // diag: see post-function-output flow
+        }
         if (strcmp(type->valuestring, "session.created") == 0 || strcmp(type->valuestring, "session.updated") == 0) {
             xEventGroupSetBits(event_group_handle_, GPT_REALTIME_SESSION_READY_EVENT);
         } else if (strcmp(type->valuestring, "response.output_audio.delta") == 0 ||
                    strcmp(type->valuestring, "response.audio.delta") == 0) {
             HandleAudioDelta(root);
+        } else if (strcmp(type->valuestring, "response.output_item.added") == 0 ||
+                   strcmp(type->valuestring, "response.output_item.done") == 0) {
+            RememberFunctionCallName(root);
+        } else if (strcmp(type->valuestring, "response.function_call_arguments.done") == 0) {
+            HandleFunctionCall(root);
         } else if (strcmp(type->valuestring, "response.output_audio.done") == 0 ||
                    strcmp(type->valuestring, "response.audio.done") == 0 ||
                    strcmp(type->valuestring, "response.done") == 0) {
+            if (strcmp(type->valuestring, "response.done") == 0 && HandleFunctionCallsFromResponseDone(root)) {
+                cJSON_Delete(root);
+                return;
+            }
             // The server finishes sending faster than real time. Don't stop now or
             // we'd cut playback short; mark the response complete and let the output
             // audio task emit "stop" once it has played out the buffered audio.
@@ -545,6 +895,278 @@ void GptRealtimeProtocol::HandleTextMessage(const char* data, size_t len)
     }
 
     cJSON_Delete(root);
+}
+
+void GptRealtimeProtocol::RememberFunctionCallName(const cJSON* root)
+{
+    auto item = cJSON_GetObjectItem(root, "item");
+    if (!cJSON_IsObject(item)) {
+        return;
+    }
+    auto type = cJSON_GetObjectItem(item, "type");
+    auto name = cJSON_GetObjectItem(item, "name");
+    auto call_id = cJSON_GetObjectItem(item, "call_id");
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "function_call") == 0 && cJSON_IsString(name) &&
+        cJSON_IsString(call_id)) {
+        std::lock_guard<std::mutex> lock(function_call_mutex_);
+        function_call_names_[call_id->valuestring] = name->valuestring;
+        ESP_LOGI(TAG, "Remember function call: call_id=%s name=%s", call_id->valuestring, name->valuestring);
+    }
+}
+
+bool GptRealtimeProtocol::ExecuteStackChanCameraTool(const char* function_name, const cJSON* args, std::string& output)
+{
+    if (strcmp(function_name, "stackchan_take_photo") == 0) {
+        auto question = cJSON_GetObjectItem(args, "question");
+        return CaptureImageForFunctionTool(false, 0, 20, 250, 0,
+                                           cJSON_IsString(question) ? question->valuestring : "What is visible?",
+                                           output);
+    }
+    if (strcmp(function_name, "stackchan_look_and_take_photo") == 0) {
+        auto yaw = cJSON_GetObjectItem(args, "yaw");
+        auto pitch = cJSON_GetObjectItem(args, "pitch");
+        auto speed = cJSON_GetObjectItem(args, "speed");
+        auto settle_ms = cJSON_GetObjectItem(args, "settle_ms");
+        auto question = cJSON_GetObjectItem(args, "question");
+        return CaptureImageForFunctionTool(
+            true, cJSON_IsNumber(yaw) ? yaw->valueint : 0, cJSON_IsNumber(pitch) ? pitch->valueint : 20,
+            cJSON_IsNumber(speed) ? speed->valueint : 250, cJSON_IsNumber(settle_ms) ? settle_ms->valueint : 1800,
+            cJSON_IsString(question) ? question->valuestring : "What is visible?", output);
+    }
+
+    output = "{\"success\":false,\"error\":\"Unknown function\"}";
+    return false;
+}
+
+void GptRealtimeProtocol::HandleFunctionCall(const cJSON* root)
+{
+    auto name = cJSON_GetObjectItem(root, "name");
+    auto call_id = cJSON_GetObjectItem(root, "call_id");
+    auto arguments = cJSON_GetObjectItem(root, "arguments");
+    if (!cJSON_IsString(call_id)) {
+        ESP_LOGW(TAG, "Function call event missing call_id");
+        return;
+    }
+    std::string function_name;
+    if (cJSON_IsString(name)) {
+        function_name = name->valuestring;
+    } else {
+        std::lock_guard<std::mutex> lock(function_call_mutex_);
+        auto remembered = function_call_names_.find(call_id->valuestring);
+        if (remembered != function_call_names_.end()) {
+            function_name = remembered->second;
+        }
+    }
+    if (function_name.empty()) {
+        ESP_LOGW(TAG, "Function call event missing name for call_id=%s", call_id->valuestring);
+        return;
+    }
+
+    DispatchFunctionCall(call_id->valuestring, function_name,
+                         cJSON_IsString(arguments) ? arguments->valuestring : "{}");
+}
+
+void GptRealtimeProtocol::DispatchFunctionCall(const std::string& call_id, const std::string& function_name,
+                                               const std::string& arguments_json)
+{
+    {
+        std::lock_guard<std::mutex> lock(function_call_mutex_);
+        // Grok emits both response.function_call_arguments.done and a function_call
+        // entry inside response.done for the same call_id. Run each call only once.
+        if (!dispatched_call_ids_.insert(call_id).second) {
+            ESP_LOGI(TAG, "Skip duplicate function call: call_id=%s", call_id.c_str());
+            return;
+        }
+    }
+
+    // The camera tool blocks on a touch OK/NG confirmation and a synchronous Grok
+    // vision HTTP request. Running it inline would freeze the WebSocket receive task
+    // (no more audio/events processed -> "voice stops after a photo"). Spawning a
+    // dedicated task here fails under memory pressure ("pthread: Failed to create
+    // task!" -> abort), so run it on the main application loop instead -- the same
+    // proven pattern as the MCP camera tool. It has a large stack, leaves the receive
+    // task free, and SendText is mutex-protected so emitting from there is safe.
+    Application::GetInstance().Schedule([this, call_id, function_name, arguments_json]() {
+        cJSON* args = cJSON_Parse(arguments_json.c_str());
+        if (args == nullptr) {
+            args = cJSON_CreateObject();
+        }
+        std::string output;
+        bool ok = false;
+        try {
+            ESP_LOGI(TAG, "Execute function call: call_id=%s name=%s args=%s", call_id.c_str(),
+                     function_name.c_str(), arguments_json.c_str());
+            ok = ExecuteStackChanCameraTool(function_name.c_str(), args, output);
+        } catch (const std::exception& e) {
+            output = std::string("{\"success\":false,\"error\":\"") + e.what() + "\"}";
+        }
+        cJSON_Delete(args);
+
+        if (!ok && output.empty()) {
+            output = "{\"success\":false,\"error\":\"Function failed\"}";
+        }
+
+        cJSON* response = cJSON_CreateObject();
+        cJSON_AddStringToObject(response, "type", "conversation.item.create");
+        cJSON* item = cJSON_AddObjectToObject(response, "item");
+        cJSON_AddStringToObject(item, "type", "function_call_output");
+        cJSON_AddStringToObject(item, "call_id", call_id.c_str());
+        cJSON_AddStringToObject(item, "output", output.c_str());
+        char* json = cJSON_PrintUnformatted(response);
+        bool out_ok = SendText(json);
+        cJSON_free(json);
+        cJSON_Delete(response);
+        // A bare response.create after the function output produced an EMPTY response
+        // (the original tool-call turn already closed with response.done while we spent
+        // ~7s capturing). Give explicit instructions so the model actually speaks the
+        // photo result on this new turn instead of waiting for the user.
+        bool resp_ok = SendText(
+            "{\"type\":\"response.create\",\"response\":{\"instructions\":\"The camera photo result is now in the "
+            "conversation as the latest function result. Immediately tell the user, in your own spoken voice, what is "
+            "in the photo and answer their question. Do not wait for further input.\"}}");
+        ESP_LOGI(TAG, "Function output sent: call_id=%s output_ok=%d response_create_ok=%d output=%.200s",
+                 call_id.c_str(), out_ok, resp_ok, output.c_str());
+
+        {
+            std::lock_guard<std::mutex> lock(function_call_mutex_);
+            function_call_names_.erase(call_id);
+            // Keep dispatched_call_ids_ so a late response.done duplicate stays suppressed.
+        }
+    });
+}
+
+bool GptRealtimeProtocol::HandleFunctionCallsFromResponseDone(const cJSON* root)
+{
+    auto response = cJSON_GetObjectItem(root, "response");
+    auto items = cJSON_GetObjectItem(response, "output");
+    if (!cJSON_IsArray(items)) {
+        return false;
+    }
+
+    bool handled = false;
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, items) {
+        auto type = cJSON_GetObjectItem(item, "type");
+        if (!cJSON_IsString(type) || strcmp(type->valuestring, "function_call") != 0) {
+            continue;
+        }
+        auto name = cJSON_GetObjectItem(item, "name");
+        auto call_id = cJSON_GetObjectItem(item, "call_id");
+        auto arguments = cJSON_GetObjectItem(item, "arguments");
+        if (!cJSON_IsString(name) || !cJSON_IsString(call_id)) {
+            continue;
+        }
+
+        // DispatchFunctionCall dedupes by call_id (this is usually the duplicate of the
+        // response.function_call_arguments.done event) and runs off the receive task.
+        DispatchFunctionCall(call_id->valuestring, name->valuestring,
+                             cJSON_IsString(arguments) ? arguments->valuestring : "{}");
+        handled = true;
+    }
+
+    // Return true when the response carried function calls so the caller skips the
+    // normal terminal handling; the response.create is sent by the worker.
+    return handled;
+}
+
+bool GptRealtimeProtocol::CaptureImageForFunctionTool(bool move_head, int yaw, int pitch, int speed, int settle_ms,
+                                                      const std::string& question, std::string& output)
+{
+    auto& board = Board::GetInstance();
+    auto camera = board.GetCamera();
+    auto display = dynamic_cast<LvglDisplay*>(board.GetDisplay());
+    if (camera == nullptr || display == nullptr) {
+        output = "{\"success\":false,\"error\":\"Camera or display is unavailable\"}";
+        return false;
+    }
+
+    if (move_head) {
+        auto& motion = GetStackChan().motion();
+        motion.setModifyLock(true);
+        {
+            DisplayLockGuard lock(board.GetDisplay());
+            ESP_LOGI(TAG, "Move head for camera tool: yaw=%d pitch=%d speed=%d settle_ms=%d", yaw, pitch, speed,
+                     settle_ms);
+            MoveStackChanHeadFromJson(yaw, pitch, speed);
+        }
+        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+        motion.setModifyLock(false);
+    }
+
+    TaskPriorityReset priority_reset(1);
+    if (!camera->Capture()) {
+        output = "{\"success\":false,\"error\":\"Failed to capture photo\"}";
+        return false;
+    }
+
+    bool accepted = false;
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (done == nullptr) {
+        display->SetPreviewImage(nullptr);
+        output = "{\"success\":false,\"error\":\"Failed to create photo review semaphore\"}";
+        return false;
+    }
+    display->ShowImageConfirmation([done, &accepted](bool ok) {
+        accepted = ok;
+        xSemaphoreGive(done);
+    });
+    xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+    if (!accepted) {
+        display->SetPreviewImage(nullptr);
+        output = "{\"success\":false,\"error\":\"User rejected the photo\"}";
+        return false;
+    }
+
+    std::string data_uri;
+    if (!camera->EncodeToJpegDataUri(data_uri, 80)) {
+        display->SetPreviewImage(nullptr);
+        output = "{\"success\":false,\"error\":\"Failed to encode photo\"}";
+        return false;
+    }
+    display->SetPreviewImage(nullptr);
+
+    if (provider_ == RealtimeProvider::OpenAi) {
+        const std::string note =
+            "The user approved this camera photo for the current function call. Use it as visual context to answer the user's question: " +
+            question;
+        if (!SendImageMessage(data_uri, note)) {
+            output = "{\"success\":false,\"error\":\"Failed to attach photo to conversation\"}";
+            return false;
+        }
+
+        cJSON* result = cJSON_CreateObject();
+        cJSON_AddBoolToObject(result, "success", true);
+        cJSON_AddStringToObject(result, "question", question.c_str());
+        cJSON_AddStringToObject(result, "result",
+                                "The approved camera photo was attached to the conversation as visual context.");
+        char* json = cJSON_PrintUnformatted(result);
+        output.assign(json);
+        cJSON_free(json);
+        cJSON_Delete(result);
+        return true;
+    }
+
+    // The vision query takes a few seconds; show the user it is in progress so the
+    // device doesn't look frozen while waiting on the API.
+    display->SetChatMessage("system", "画像を確認しています…");
+
+    std::string description;
+    if (!DescribeImageWithGrok(data_uri, description)) {
+        display->SetChatMessage("system", "画像の確認に失敗しました");
+        output = "{\"success\":false,\"error\":\"Failed to describe photo\"}";
+        return false;
+    }
+
+    cJSON* result = cJSON_CreateObject();
+    cJSON_AddBoolToObject(result, "success", true);
+    cJSON_AddStringToObject(result, "question", question.c_str());
+    cJSON_AddStringToObject(result, "visual_description", description.c_str());
+    char* json = cJSON_PrintUnformatted(result);
+    output.assign(json);
+    cJSON_free(json);
+    cJSON_Delete(result);
+    return true;
 }
 
 void GptRealtimeProtocol::HandleAudioDelta(const cJSON* root)

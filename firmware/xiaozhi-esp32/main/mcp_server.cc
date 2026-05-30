@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "application.h"
 #include "display.h"
@@ -115,8 +117,33 @@ void McpServer::AddCommonTools() {
                 if (!camera->Capture()) {
                     throw std::runtime_error("Failed to capture photo");
                 }
+                auto display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay());
+                if (display == nullptr) {
+                    throw std::runtime_error("Photo review screen is unavailable");
+                }
+                bool accepted = false;
+                SemaphoreHandle_t done = xSemaphoreCreateBinary();
+                if (done == nullptr) {
+                    throw std::runtime_error("Failed to create photo review semaphore");
+                }
+                display->ShowImageConfirmation([done, &accepted](bool ok) {
+                    accepted = ok;
+                    xSemaphoreGive(done);
+                });
+                xSemaphoreTake(done, portMAX_DELAY);
+                vSemaphoreDelete(done);
+                if (!accepted) {
+                    throw std::runtime_error("User rejected the photo");
+                }
                 auto question = properties["question"].value<std::string>();
-                return camera->Explain(question);
+                try {
+                    auto result = camera->Explain(question);
+                    display->SetPreviewImage(nullptr);
+                    return result;
+                } catch (...) {
+                    display->SetPreviewImage(nullptr);
+                    throw;
+                }
             });
     }
 #endif

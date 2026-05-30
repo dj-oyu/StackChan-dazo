@@ -9,6 +9,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_timer.h>
 #include <memory>
+#include <functional>
 
 class StackChanAvatarDisplay : public LvglDisplay {
 private:
@@ -24,8 +25,15 @@ private:
     lv_obj_t* preview_image_                         = nullptr;
     esp_timer_handle_t preview_timer_                = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    lv_obj_t* camera_button_                         = nullptr;
+    lv_obj_t* image_confirm_panel_                   = nullptr;
+    bool camera_button_visible_                      = false;
+    std::function<void(bool accepted)> image_confirm_callback_;
 
     void CreateIdleMotionModifier();
+    void CreateCameraButton();
+    void RefreshCameraButton();
+    void CloseImageConfirmation(bool accepted);
 
 protected:
     virtual bool Lock(int timeout_ms = 0) override;
@@ -44,6 +52,8 @@ public:
     virtual void OnChatMessageComplete() override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
+    virtual void SetCameraButtonVisible(bool visible) override;
+    virtual void ShowImageConfirmation(std::function<void(bool accepted)> callback) override;
     virtual void UpdateStatusBar(bool update_all = false) override;
     virtual void SetupUI() override;
     virtual void SetTheme(Theme* theme) override;

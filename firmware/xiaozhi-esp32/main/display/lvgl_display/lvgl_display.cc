@@ -221,6 +221,16 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
 void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 }
 
+void LvglDisplay::SetCameraButtonVisible(bool visible) {
+    (void)visible;
+}
+
+void LvglDisplay::ShowImageConfirmation(std::function<void(bool accepted)> callback) {
+    if (callback) {
+        callback(false);
+    }
+}
+
 void LvglDisplay::SetPowerSaveMode(bool on) {
     if (on) {
         SetChatMessage("system", "");

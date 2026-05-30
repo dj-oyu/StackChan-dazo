@@ -1,6 +1,7 @@
 #include "application.h"
 #include "board.h"
 #include "display.h"
+#include "lvgl_display.h"
 #include "system_info.h"
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
@@ -15,6 +16,7 @@
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
+#include <freertos/semphr.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
@@ -66,6 +68,11 @@ void Application::Initialize() {
     // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();
+#ifdef HAVE_LVGL
+    if (auto lvgl_display = dynamic_cast<LvglDisplay*>(display)) {
+        lvgl_display->SetCameraButtonVisible(board.GetCamera() != nullptr);
+    }
+#endif
     // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
@@ -392,6 +399,11 @@ void Application::CheckAssetsVersion() {
 
     // Apply assets
     assets.Apply();
+#ifdef HAVE_LVGL
+    if (auto lvgl_display = dynamic_cast<LvglDisplay*>(display)) {
+        lvgl_display->SetCameraButtonVisible(board.GetCamera() != nullptr);
+    }
+#endif
     display->SetChatMessage("system", "");
     display->SetEmotion("microchip_ai");
 }
@@ -1111,6 +1123,86 @@ void Application::SendMcpMessage(const std::string& payload) {
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
         }
+    });
+}
+
+void Application::RequestCameraAttachment() {
+    Schedule([this]() {
+#ifdef HAVE_LVGL
+        auto& board = Board::GetInstance();
+        auto camera = board.GetCamera();
+        auto display = dynamic_cast<LvglDisplay*>(board.GetDisplay());
+        if (camera == nullptr || display == nullptr) {
+            return;
+        }
+        if (!protocol_) {
+            display->ShowNotification("AI provider is not ready");
+            return;
+        }
+        if (!protocol_->SupportsImageAttachment()) {
+            display->ShowNotification("This provider cannot attach images");
+            return;
+        }
+        if (GetDeviceState() == kDeviceStateActivating || GetDeviceState() == kDeviceStateUpgrading ||
+            GetDeviceState() == kDeviceStateWifiConfiguring) {
+            return;
+        }
+        if (GetDeviceState() == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+        }
+
+        TaskPriorityReset priority_reset(1);
+        if (!camera->Capture()) {
+            display->ShowNotification("Failed to capture photo");
+            return;
+        }
+
+        bool accepted = false;
+        SemaphoreHandle_t done = xSemaphoreCreateBinary();
+        if (done == nullptr) {
+            display->SetPreviewImage(nullptr);
+            return;
+        }
+        display->ShowImageConfirmation([done, &accepted](bool ok) {
+            accepted = ok;
+            xSemaphoreGive(done);
+        });
+        xSemaphoreTake(done, portMAX_DELAY);
+        vSemaphoreDelete(done);
+
+        if (!accepted) {
+            display->SetPreviewImage(nullptr);
+            display->ShowNotification("Photo discarded");
+            return;
+        }
+
+        std::string data_uri;
+        if (!camera->EncodeToJpegDataUri(data_uri, 80)) {
+            display->SetPreviewImage(nullptr);
+            display->ShowNotification("Failed to encode photo");
+            return;
+        }
+
+        if (!protocol_->IsAudioChannelOpened()) {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
+            SetDeviceState(kDeviceStateIdle);
+        }
+
+        const std::string note =
+            "The user approved and attached this camera photo. Use it as visual context for the next voice request.";
+        if (!protocol_->SendImageMessage(data_uri, note)) {
+            display->ShowNotification("This provider cannot attach images");
+            display->SetPreviewImage(nullptr);
+            return;
+        }
+
+        display->SetPreviewImage(nullptr);
+        display->ShowNotification("Photo attached. Ask by voice.");
+#endif
     });
 }
 

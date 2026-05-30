@@ -7,6 +7,7 @@ class Camera {
 public:
     virtual void SetExplainUrl(const std::string& url, const std::string& token) = 0;
     virtual bool Capture() = 0;
+    virtual bool EncodeToJpegDataUri(std::string& data_uri, int quality = 80) { return false; }
     virtual bool SetHMirror(bool enabled) = 0;
     virtual bool SetVFlip(bool enabled) = 0;
     virtual bool SetSwapBytes(bool enabled) { return false; }  // Optional, default no-op

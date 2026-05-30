@@ -7,6 +7,7 @@
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <cstring>
+#include <mbedtls/base64.h>
 
 #include "esp_imgfx_color_convert.h"
 #include "esp_video_device.h"
@@ -217,10 +218,10 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 #else
     auto get_rank = [](uint32_t fmt) -> int {
         switch (fmt) {
+            case V4L2_PIX_FMT_RGB565:
+                return 9;  // prefer RGB565: this GC0308/esp_video path delivers clean RGB565
             case V4L2_PIX_FMT_YUV422P:
                 return 10;
-            case V4L2_PIX_FMT_RGB565:
-                return 11;
             case V4L2_PIX_FMT_RGB24:
                 return 12;
 #ifdef CONFIG_XIAOZHI_ENABLE_HARDWARE_JPEG_ENCODER
@@ -261,7 +262,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
         return;
     }
 
-    ESP_LOGD(TAG, "selected pixel format: 0x%08lx", setformat.fmt.pix.pixelformat);
+    ESP_LOGI(TAG, "selected pixel format: 0x%08lx", setformat.fmt.pix.pixelformat);
 
     if (ioctl(video_fd_, VIDIOC_S_FMT, &setformat) != 0) {
         ESP_LOGE(TAG, "VIDIOC_S_FMT failed, errno=%d(%s)", errno, strerror(errno));
@@ -392,6 +393,60 @@ void StackChanCamera::SetExplainUrl(const std::string& url, const std::string& t
     explain_token_ = token;
 }
 
+bool StackChanCamera::EncodeToJpegDataUri(std::string& data_uri, int quality)
+{
+    data_uri.clear();
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
+    }
+    if (frame_.data == nullptr || frame_.len == 0) {
+        ESP_LOGE(TAG, "No captured frame available for JPEG encoding");
+        return false;
+    }
+
+    std::string jpeg_data;
+#ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
+    if (frame_.format == V4L2_PIX_FMT_JPEG) {
+        jpeg_data.assign(reinterpret_cast<const char*>(frame_.data), frame_.len);
+    } else
+#endif
+    {
+        const uint16_t w = frame_.width ? frame_.width : 320;
+        const uint16_t h = frame_.height ? frame_.height : 240;
+        bool ok = image_to_jpeg_cb(
+            frame_.data, frame_.len, w, h, frame_.format, quality,
+            [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+                auto output = static_cast<std::string*>(arg);
+                if (data != nullptr && len > 0) {
+                    output->append(static_cast<const char*>(data), len);
+                }
+                return len;
+            },
+            &jpeg_data);
+        if (!ok || jpeg_data.empty()) {
+            ESP_LOGE(TAG, "Failed to encode captured frame to JPEG");
+            return false;
+        }
+    }
+
+    size_t encoded_len = 0;
+    mbedtls_base64_encode(nullptr, 0, &encoded_len, reinterpret_cast<const unsigned char*>(jpeg_data.data()),
+                          jpeg_data.size());
+    std::string encoded(encoded_len, '\0');
+    size_t actual_len = 0;
+    if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(encoded.data()), encoded.size(), &actual_len,
+                              reinterpret_cast<const unsigned char*>(jpeg_data.data()), jpeg_data.size()) != 0) {
+        ESP_LOGE(TAG, "Failed to base64 encode JPEG data");
+        return false;
+    }
+    encoded.resize(actual_len);
+    data_uri = "data:image/jpeg;base64,";
+    data_uri += encoded;
+    ESP_LOGI(TAG, "Encoded camera attachment: jpeg=%u bytes, data_uri=%u bytes", (unsigned)jpeg_data.size(),
+             (unsigned)data_uri.size());
+    return true;
+}
+
 bool StackChanCamera::Capture()
 {
     if (encoder_thread_.joinable()) {
@@ -437,8 +492,8 @@ bool StackChanCamera::Capture()
             ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
                      mmap_buffers_[buf.index].length, frame_.width, frame_.height);
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 256),
-                                   ESP_LOG_DEBUG);
+            ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 64),
+                                   ESP_LOG_INFO);  // diag: inspect raw pixel layout (packed YUYV vs planar)
 
             switch (sensor_format_) {
                 case V4L2_PIX_FMT_RGB565:
@@ -465,21 +520,9 @@ bool StackChanCamera::Capture()
                     frame_.format = sensor_format_;
                     break;
                 case V4L2_PIX_FMT_YUV422P: {
-                    // 这个格式是 422 YUYV，不是 planer
                     frame_.format = V4L2_PIX_FMT_YUYV;
-#ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
-                    {
-                        auto src16   = (uint16_t*)mmap_buffers_[buf.index].start;
-                        auto dst16   = (uint16_t*)frame_.data;
-                        size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
-                        for (size_t i = 0; i < count; i++) {
-                            dst16[i] = __builtin_bswap16(src16[i]);
-                        }
-                    }
-#else
                     memcpy(frame_.data, mmap_buffers_[buf.index].start,
                            MIN(mmap_buffers_[buf.index].length, frame_.len));
-#endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
                     break;
                 }
                 case V4L2_PIX_FMT_RGB565X: {
@@ -754,64 +797,70 @@ bool StackChanCamera::Capture()
         lv_color_format_t color_format = LV_COLOR_FORMAT_RGB565;
         uint8_t* data                  = nullptr;
 
+        ESP_LOGI(TAG, "preview build: frame.format=0x%08lx sensor_format=0x%08lx w=%u h=%u len=%u",
+                 (unsigned long)frame_.format, (unsigned long)sensor_format_, (unsigned)w, (unsigned)h,
+                 (unsigned)frame_.len);
+
         switch (frame_.format) {
             // LVGL 显示 YUV 系的图像似乎都有问题，暂时转换为 RGB565 显示
-            case V4L2_PIX_FMT_YUYV:
-            case V4L2_PIX_FMT_YUV420:
-            case V4L2_PIX_FMT_RGB24: {
-                color_format = LV_COLOR_FORMAT_RGB565;
-                data         = (uint8_t*)heap_caps_malloc(w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            case V4L2_PIX_FMT_YUYV: {
+                // Standard packed YUYV: Y0 Cb Y1 Cr. Sensor reg 0x24 = 0xa2 (factory value). Convert
+                // 1:1 -> RGB565. (320x240 matches the display; no downscale needed.)
+                color_format       = LV_COLOR_FORMAT_RGB565;
+                data               = (uint8_t*)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (data == nullptr) {
                     ESP_LOGE(TAG, "Failed to allocate memory for preview image");
                     return false;
                 }
-                esp_imgfx_color_convert_cfg_t convert_cfg = {
-                    .in_res          = {.width  = static_cast<int16_t>(frame_.width),
-                                        .height = static_cast<int16_t>(frame_.height)},
-                    .in_pixel_fmt    = static_cast<esp_imgfx_pixel_fmt_t>(frame_.format),
-                    .out_pixel_fmt   = ESP_IMGFX_PIXEL_FMT_RGB565_LE,
-                    .color_space_std = ESP_IMGFX_COLOR_SPACE_STD_BT601,
-                };
-                esp_imgfx_color_convert_handle_t convert_handle = nullptr;
-                esp_imgfx_err_t err = esp_imgfx_color_convert_open(&convert_cfg, &convert_handle);
-                if (err != ESP_IMGFX_ERR_OK || convert_handle == nullptr) {
-                    ESP_LOGE(TAG, "esp_imgfx_color_convert_open failed");
-                    heap_caps_free(data);
-                    data = nullptr;
-                    return false;
+                const uint8_t* src       = frame_.data;
+                const size_t   in_stride = (size_t)w * 2;  // packed: 2 bytes/pixel
+                uint16_t*      dst       = (uint16_t*)data;
+                // DIAG: treat the buffer as RGB565 big-endian (2 bytes/pixel) instead of YUYV.
+                // Raw red `c1 a5`->0xc1a5 and green `16 a2`->0x16a2 decode as textbook RGB565.
+                for (uint16_t y = 0; y < h; y++) {
+                    const uint8_t* row = src + (size_t)y * in_stride;
+                    for (uint16_t x = 0; x < w; x++) {
+                        const uint8_t b0 = row[(size_t)x * 2];
+                        const uint8_t b1 = row[(size_t)x * 2 + 1];
+                        dst[(size_t)y * w + x] = (uint16_t)((b0 << 8) | b1);
+                    }
                 }
-                esp_imgfx_data_t convert_input_data = {
-                    .data     = frame_.data,
-                    .data_len = frame_.len,
-                };
-                esp_imgfx_data_t convert_output_data = {
-                    .data     = data,
-                    .data_len = static_cast<uint32_t>(w * h * 2),
-                };
-                err = esp_imgfx_color_convert_process(convert_handle, &convert_input_data, &convert_output_data);
-                if (err != ESP_IMGFX_ERR_OK) {
-                    ESP_LOGE(TAG, "esp_imgfx_color_convert_process failed");
-                    heap_caps_free(data);
-                    data = nullptr;
-                    esp_imgfx_color_convert_close(convert_handle);
-                    convert_handle = nullptr;
-                    return false;
+                lvgl_image_size = (size_t)w * h * 2;
+                {
+                    const size_t ci = ((size_t)h / 2) * w + w / 2;
+                    const uint16_t cv = dst[ci];
+                    ESP_LOGI(TAG, "preview YUYV->RGB565 %ux%u center 0x%04x (R=%d G=%d B=%d)", (unsigned)w,
+                             (unsigned)h, cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
+                    // DIAG: raw center strip (packed Y0 Cb Y1 Cr ...) to inspect chroma directly.
+                    const size_t center_byte = ((size_t)(h / 2) * w + w / 2) * 2;
+                    ESP_LOG_BUFFER_HEXDUMP(TAG, src + center_byte, 48, ESP_LOG_INFO);
                 }
-                esp_imgfx_color_convert_close(convert_handle);
-                convert_handle  = nullptr;
-                lvgl_image_size = w * h * 2;
                 break;
             }
 
-            case V4L2_PIX_FMT_RGB565:
+            case V4L2_PIX_FMT_RGB565: {
                 data = (uint8_t*)heap_caps_malloc(w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (data == nullptr) {
                     ESP_LOGE(TAG, "Failed to allocate memory for preview image");
                     return false;
                 }
-                memcpy(data, frame_.data, frame_.len);
-                lvgl_image_size = frame_.len;  // fallthrough 时兼顾 YUYV 与 RGB565
+                // Repack as big-endian RGB565 (raw byte0<<8 | byte1): verified red `c1 a5`->0xc1a5 (red),
+                // green `16 a2`->0x16a2 (green). Matches the display's expected RGB565 word order.
+                const uint8_t* rsrc = frame_.data;
+                uint16_t*      rdst = (uint16_t*)data;
+                const size_t   npx  = (size_t)w * h;
+                for (size_t i = 0; i < npx; i++) {
+                    rdst[i] = (uint16_t)((rsrc[i * 2] << 8) | rsrc[i * 2 + 1]);
+                }
+                lvgl_image_size = (size_t)w * h * 2;
+                {
+                    const size_t ci = ((size_t)h / 2) * (size_t)w + (size_t)w / 2;
+                    const uint16_t cv = rdst[ci];
+                    ESP_LOGI(TAG, "preview RGB565 center: raw=%02x %02x -> 0x%04x (R=%d G=%d B=%d)",
+                             rsrc[ci * 2], rsrc[ci * 2 + 1], cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
+                }
                 break;
+            }
 
 #ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
             case V4L2_PIX_FMT_JPEG: {
@@ -893,8 +942,8 @@ bool StackChanCamera::StreamCaptures()
             ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
                      mmap_buffers_[buf.index].length, frame_.width, frame_.height);
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 256),
-                                   ESP_LOG_DEBUG);
+            ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 64),
+                                   ESP_LOG_INFO);  // diag: inspect raw pixel layout (packed YUYV vs planar)
 
             switch (sensor_format_) {
                 case V4L2_PIX_FMT_RGB565:
@@ -921,21 +970,9 @@ bool StackChanCamera::StreamCaptures()
                     frame_.format = sensor_format_;
                     break;
                 case V4L2_PIX_FMT_YUV422P: {
-                    // 这个格式是 422 YUYV，不是 planer
                     frame_.format = V4L2_PIX_FMT_YUYV;
-#ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
-                    {
-                        auto src16   = (uint16_t*)mmap_buffers_[buf.index].start;
-                        auto dst16   = (uint16_t*)frame_.data;
-                        size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
-                        for (size_t i = 0; i < count; i++) {
-                            dst16[i] = __builtin_bswap16(src16[i]);
-                        }
-                    }
-#else
                     memcpy(frame_.data, mmap_buffers_[buf.index].start,
                            MIN(mmap_buffers_[buf.index].length, frame_.len));
-#endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
                     break;
                 }
                 case V4L2_PIX_FMT_RGB565X: {
