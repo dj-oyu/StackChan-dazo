@@ -486,14 +486,14 @@ bool StackChanCamera::Capture()
             }
 
 #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
+            ESP_LOGD(TAG, "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
                      mmap_buffers_[buf.index].length, sensor_width_, sensor_height_);
 #else
-            ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
+            ESP_LOGD(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
                      mmap_buffers_[buf.index].length, frame_.width, frame_.height);
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
             ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 64),
-                                   ESP_LOG_INFO);  // diag: inspect raw pixel layout (packed YUYV vs planar)
+                                   ESP_LOG_DEBUG);
 
             switch (sensor_format_) {
                 case V4L2_PIX_FMT_RGB565:
@@ -797,7 +797,7 @@ bool StackChanCamera::Capture()
         lv_color_format_t color_format = LV_COLOR_FORMAT_RGB565;
         uint8_t* data                  = nullptr;
 
-        ESP_LOGI(TAG, "preview build: frame.format=0x%08lx sensor_format=0x%08lx w=%u h=%u len=%u",
+        ESP_LOGD(TAG, "preview build: frame.format=0x%08lx sensor_format=0x%08lx w=%u h=%u len=%u",
                  (unsigned long)frame_.format, (unsigned long)sensor_format_, (unsigned)w, (unsigned)h,
                  (unsigned)frame_.len);
 
@@ -833,7 +833,7 @@ bool StackChanCamera::Capture()
                 {
                     const size_t ci = ((size_t)ho / 2) * wo + wo / 2;
                     const uint16_t cv = dst[ci];
-                    ESP_LOGI(TAG, "preview RGB565 %ux%u center 0x%04x (R=%d G=%d B=%d)", (unsigned)wo,
+                    ESP_LOGD(TAG, "preview RGB565 %ux%u center 0x%04x (R=%d G=%d B=%d)", (unsigned)wo,
                              (unsigned)ho, cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
                 }
                 break;
@@ -857,7 +857,7 @@ bool StackChanCamera::Capture()
                 {
                     const size_t ci = ((size_t)h / 2) * (size_t)w + (size_t)w / 2;
                     const uint16_t cv = rdst[ci];
-                    ESP_LOGI(TAG, "preview RGB565 center: raw=%02x %02x -> 0x%04x (R=%d G=%d B=%d)",
+                    ESP_LOGD(TAG, "preview RGB565 center: raw=%02x %02x -> 0x%04x (R=%d G=%d B=%d)",
                              rsrc[ci * 2], rsrc[ci * 2 + 1], cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
                 }
                 break;
@@ -937,14 +937,14 @@ bool StackChanCamera::StreamCaptures()
             }
 
 #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-            ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
+            ESP_LOGD(TAG, "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
                      mmap_buffers_[buf.index].length, sensor_width_, sensor_height_);
 #else
-            ESP_LOGW(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
+            ESP_LOGD(TAG, "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
                      mmap_buffers_[buf.index].length, frame_.width, frame_.height);
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
             ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start, MIN(mmap_buffers_[buf.index].length, 64),
-                                   ESP_LOG_INFO);  // diag: inspect raw pixel layout (packed YUYV vs planar)
+                                   ESP_LOG_DEBUG);
 
             switch (sensor_format_) {
                 case V4L2_PIX_FMT_RGB565:
