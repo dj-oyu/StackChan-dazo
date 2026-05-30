@@ -804,36 +804,37 @@ bool StackChanCamera::Capture()
         switch (frame_.format) {
             // LVGL 显示 YUV 系的图像似乎都有问题，暂时转换为 RGB565 显示
             case V4L2_PIX_FMT_YUYV: {
-                // Standard packed YUYV: Y0 Cb Y1 Cr. Sensor reg 0x24 = 0xa2 (factory value). Convert
-                // 1:1 -> RGB565. (320x240 matches the display; no downscale needed.)
-                color_format       = LV_COLOR_FORMAT_RGB565;
-                data               = (uint8_t*)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                // The GC0308/esp_video buffer is actually RGB565 (big-endian, 2 bytes/pixel) even though
+                // it is labelled YUV422. Reinterpret as RGB565; if the frame is larger than the 320x240
+                // display (e.g. 640x480), nearest-neighbour downscale 2:1 so it fits.
+                const uint16_t scale = (w > 320) ? 2 : 1;
+                const uint16_t wo    = w / scale;
+                const uint16_t ho    = h / scale;
+                color_format         = LV_COLOR_FORMAT_RGB565;
+                data = (uint8_t*)heap_caps_malloc((size_t)wo * ho * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (data == nullptr) {
                     ESP_LOGE(TAG, "Failed to allocate memory for preview image");
                     return false;
                 }
                 const uint8_t* src       = frame_.data;
-                const size_t   in_stride = (size_t)w * 2;  // packed: 2 bytes/pixel
+                const size_t   in_stride = (size_t)w * 2;  // 2 bytes/pixel
                 uint16_t*      dst       = (uint16_t*)data;
-                // DIAG: treat the buffer as RGB565 big-endian (2 bytes/pixel) instead of YUYV.
-                // Raw red `c1 a5`->0xc1a5 and green `16 a2`->0x16a2 decode as textbook RGB565.
-                for (uint16_t y = 0; y < h; y++) {
-                    const uint8_t* row = src + (size_t)y * in_stride;
-                    for (uint16_t x = 0; x < w; x++) {
-                        const uint8_t b0 = row[(size_t)x * 2];
-                        const uint8_t b1 = row[(size_t)x * 2 + 1];
-                        dst[(size_t)y * w + x] = (uint16_t)((b0 << 8) | b1);
+                for (uint16_t oy = 0; oy < ho; oy++) {
+                    const uint8_t* row = src + (size_t)(oy * scale) * in_stride;
+                    for (uint16_t ox = 0; ox < wo; ox++) {
+                        const uint8_t* p = row + (size_t)(ox * scale) * 2;  // RGB565-BE pixel
+                        dst[(size_t)oy * wo + ox] = (uint16_t)((p[0] << 8) | p[1]);
                     }
                 }
-                lvgl_image_size = (size_t)w * h * 2;
+                w               = wo;
+                h               = ho;
+                stride          = (size_t)wo * 2;
+                lvgl_image_size = (size_t)wo * ho * 2;
                 {
-                    const size_t ci = ((size_t)h / 2) * w + w / 2;
+                    const size_t ci = ((size_t)ho / 2) * wo + wo / 2;
                     const uint16_t cv = dst[ci];
-                    ESP_LOGI(TAG, "preview YUYV->RGB565 %ux%u center 0x%04x (R=%d G=%d B=%d)", (unsigned)w,
-                             (unsigned)h, cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
-                    // DIAG: raw center strip (packed Y0 Cb Y1 Cr ...) to inspect chroma directly.
-                    const size_t center_byte = ((size_t)(h / 2) * w + w / 2) * 2;
-                    ESP_LOG_BUFFER_HEXDUMP(TAG, src + center_byte, 48, ESP_LOG_INFO);
+                    ESP_LOGI(TAG, "preview RGB565 %ux%u center 0x%04x (R=%d G=%d B=%d)", (unsigned)wo,
+                             (unsigned)ho, cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
                 }
                 break;
             }
