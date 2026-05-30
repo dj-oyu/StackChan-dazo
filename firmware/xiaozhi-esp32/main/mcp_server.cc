@@ -535,6 +535,53 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     ReplyResult(id, json);
 }
 
+std::string McpServer::CallToolSync(const std::string& tool_name, const cJSON* arguments) {
+    auto tool_iter = std::find_if(tools_.begin(), tools_.end(),
+                                  [&tool_name](const McpTool* tool) { return tool->name() == tool_name; });
+    if (tool_iter == tools_.end()) {
+        throw std::runtime_error("Unknown tool: " + tool_name);
+    }
+
+    PropertyList parsed = (*tool_iter)->properties();
+    for (auto& argument : parsed) {
+        bool found = false;
+        if (cJSON_IsObject(arguments)) {
+            auto value = cJSON_GetObjectItem(arguments, argument.name().c_str());
+            if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
+                argument.set_value<bool>(value->valueint == 1);
+                found = true;
+            } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
+                argument.set_value<int>(value->valueint);
+                found = true;
+            } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
+                argument.set_value<std::string>(value->valuestring);
+                found = true;
+            }
+        }
+        if (!argument.has_default_value() && !found) {
+            throw std::runtime_error("Missing valid argument: " + argument.name());
+        }
+    }
+
+    // Call() returns the MCP result wrapper {"content":[{"type":"text","text":...}],...}.
+    // Unwrap the first text content so callers get the tool's plain result.
+    std::string mcp_result = (*tool_iter)->Call(parsed);
+    std::string text = mcp_result;
+    cJSON* root = cJSON_Parse(mcp_result.c_str());
+    if (root != nullptr) {
+        cJSON* content = cJSON_GetObjectItem(root, "content");
+        if (cJSON_IsArray(content) && cJSON_GetArraySize(content) > 0) {
+            cJSON* first = cJSON_GetArrayItem(content, 0);
+            cJSON* text_item = cJSON_GetObjectItem(first, "text");
+            if (cJSON_IsString(text_item)) {
+                text = text_item->valuestring;
+            }
+        }
+        cJSON_Delete(root);
+    }
+    return text;
+}
+
 void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments) {
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 

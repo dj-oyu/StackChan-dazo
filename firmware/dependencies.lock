@@ -160,7 +160,7 @@ dependencies:
       require: private
       version: '>=4.2'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.7.0
   espressif/esp-sr:
@@ -728,7 +728,7 @@ dependencies:
       type: service
     version: 1.0.0
   espressif/usb:
-    component_hash: 4f00ced5663505a368bafcb9bb6b2e4a5033cc5625b8f510755a75baadf4ff1d
+    component_hash: 1d90d7c7b0682dbfcc36f47cf5acf224a5cfb850a62f39cd86d3159cfec12a81
     dependencies:
     - name: idf
       require: private
@@ -743,7 +743,7 @@ dependencies:
     - esp32p4
     - esp32h4
     - linux
-    version: 1.4.0
+    version: 1.4.1
   espressif/usb_host_uvc:
     component_hash: b0cb9a3a2eaa09dc6e5cc3e47e04d0a73e47c2d3dcfb3afce959224a1fe5fb5e
     dependencies:
@@ -877,6 +877,7 @@ direct_dependencies:
 - espressif/button
 - espressif/cjson
 - espressif/cmake_utilities
+- espressif/esp-dsp
 - espressif/esp-sr
 - espressif/esp32-camera
 - espressif/esp_audio_codec
@@ -916,6 +917,6 @@ direct_dependencies:
 - waveshare/esp_lcd_sh8601
 - waveshare/esp_lcd_touch_cst9217
 - wvirgil123/sscma_client
-manifest_hash: a033395f401bae4acd7bb679eadc1369b968d1569e8c8a70b072808cd4e37f05
+manifest_hash: ee2787104b11a45bb387d452e2187877f0c1b9e7aef001647e5ddffac806387e
 target: esp32s3
 version: 3.0.0

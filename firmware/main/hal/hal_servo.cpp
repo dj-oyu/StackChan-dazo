@@ -83,8 +83,18 @@ public:
     int getCurrentAngle() override
     {
         int current_pos = _scs_bus.ReadPos(_config.id);
+        // ReadPos returns -1 on a serial failure (no-reply / CRC). If we let that fall
+        // through, (-1 - zero_pos) maps to the extreme angle limit -- and with
+        // auto-angle-sync that value is teleported into the spring animation and written
+        // straight back to the servo, so ONE bad read slams the head to its limit (the
+        // "sudden big rotation" -> current surge -> USB brown-out). Treat a failed read
+        // as "no change" by returning the last known-good angle instead.
+        if (current_pos < 0) {
+            return _last_good_angle;
+        }
         int angle       = (current_pos - _zero_pos) * 5 * 10 / 16;
         angle           = uitk::clamp(angle, getAngleLimit().x, getAngleLimit().y);
+        _last_good_angle = angle;
         // mclog::tagInfo(_tag, "id: {} current pos: {} angle: {}", _id, current_pos, angle);
         return angle;
     }
@@ -148,8 +158,9 @@ private:
     enum class Mode { Position = 0, PWM = 1 };
 
     ServoConfig_t _config;
-    int _zero_pos      = 0;
-    Mode _current_mode = Mode::Position;
+    int _zero_pos        = 0;
+    int _last_good_angle = 0;  // last valid getCurrentAngle(), returned on a failed read
+    Mode _current_mode   = Mode::Position;
 
     void check_mode(Mode targetMode)
     {

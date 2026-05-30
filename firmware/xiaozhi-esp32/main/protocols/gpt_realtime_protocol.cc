@@ -22,47 +22,43 @@
 #include <stackchan/stackchan.h>
 #include <hal/board/hal_bridge.h>
 #include <assets/assets.h>
+#include <mcp_server.h>
 #include <cstdio>
 
 #define TAG "GPT"
 
-static void MoveStackChanHeadFromJson(int yaw, int pitch, int speed)
+// Grok/OpenAI function names must match ^[a-zA-Z0-9_-]+$, but MCP tool names use
+// dots (e.g. "self.robot.set_head_angles"). Map dots to underscores for the wire
+// name; resolution back to the MCP tool compares this sanitized form so the
+// mapping never needs to be stored.
+static std::string SanitizeToolName(const std::string& name)
 {
-    auto& motion = GetStackChan().motion();
-    GetHAL().setServoPowerEnabled(true);
-    motion.setTorqueEnabled(true);
-    motion.setAutoAngleSyncEnabled(true);
-
-    char motion_json[128];
-    snprintf(motion_json, sizeof(motion_json),
-             R"({"yawServo":{"angle":%d,"speed":%d},"pitchServo":{"angle":%d,"speed":%d}})", yaw * 10, speed,
-             pitch * 10, speed);
-    GetStackChan().updateMotionFromJson(motion_json);
+    std::string out = name;
+    for (auto& c : out) {
+        if (c == '.') {
+            c = '_';
+        }
+    }
+    return out;
 }
 
-// The head move is a spring animation that keeps running on the stackchan update
-// task after MoveStackChanHeadFromJson() returns. Block until the head actually
-// reaches its target before the shutter fires (otherwise the photo is taken
-// mid-rotation), capped so a stalled servo can't hang the call, then add a short
-// post-motion settle for vibration / auto-exposure to stabilize.
-static void WaitForHeadToSettle(int extra_settle_ms)
+// Resolve a sanitized wire name back to the exact MCP tool name, or "" if none.
+static std::string ResolveMcpToolName(const std::string& wire_name)
 {
-    auto& motion = GetStackChan().motion();
+    for (McpTool* tool : McpServer::GetInstance().tools()) {
+        if (tool->user_only()) {
+            continue;
+        }
+        if (SanitizeToolName(tool->name()) == wire_name) {
+            return tool->name();
+        }
+    }
+    return "";
+}
 
-    const int poll_ms  = 20;
-    const int max_wait = 4000;
-    int waited         = 0;
-    vTaskDelay(pdMS_TO_TICKS(poll_ms));  // let the new animation target register first
-    waited += poll_ms;
-    while (motion.isMoving() && waited < max_wait) {
-        vTaskDelay(pdMS_TO_TICKS(poll_ms));
-        waited += poll_ms;
-    }
-    if (extra_settle_ms > 0) {
-        vTaskDelay(pdMS_TO_TICKS(extra_settle_ms));
-    }
-    ESP_LOGI(TAG, "Head settled: motion_wait=%dms extra=%dms still_moving=%d", waited, extra_settle_ms,
-             static_cast<int>(motion.isMoving()));
+static bool IsCameraToolName(const std::string& mcp_name)
+{
+    return mcp_name == "self.camera.take_photo" || mcp_name == "self.camera.look_and_take_photo";
 }
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
@@ -203,6 +199,39 @@ bool GptRealtimeProtocol::OpenAudioChannel()
         return false;
     }
 
+    // Route the camera's "describe the captured frame" step through this protocol's
+    // vision path. The MCP camera tools own the capture/confirm flow and call
+    // camera->Explain(); this delegate produces the visual result the right way for
+    // the active provider instead of POSTing to the (unused) explain_url. Registered
+    // here so it's set before any tool call and refreshed each session.
+    if (auto* camera = Board::GetInstance().GetCamera()) {
+        camera->SetExplainDelegate([this, camera](const std::string& question, std::string& description) -> bool {
+            std::string data_uri;
+            if (!camera->EncodeToJpegDataUri(data_uri, 80)) {
+                return false;
+            }
+            if (provider_ == RealtimeProvider::OpenAi) {
+                // OpenAI realtime can see images directly, so attach the photo to the
+                // conversation and let the model answer from it. The function result
+                // is just a confirmation note.
+                std::string note =
+                    "The user approved this camera photo for the current request. Use it as visual context to "
+                    "answer: " + question;
+                if (!SendImageMessage(data_uri, note)) {
+                    return false;
+                }
+                description = "The approved camera photo was attached to the conversation as visual context.";
+                return true;
+            }
+            // Grok's voice endpoint can't take images: describe via the separate xAI
+            // vision API and feed the text back. This call takes a few seconds.
+            if (auto* display = Board::GetInstance().GetDisplay()) {
+                display->SetChatMessage("system", "画像を確認しています…");
+            }
+            return DescribeImageWithGrok(data_uri, description);
+        });
+    }
+
     error_occurred_ = false;
     audio_channel_opened_ = false;
     input_audio_appended_ = false;
@@ -335,14 +364,12 @@ bool GptRealtimeProtocol::SendSessionUpdate()
     cJSON_AddStringToObject(session, "type", "realtime");
     cJSON_AddStringToObject(session, "model", model_.c_str());
     std::string instructions = instructions_;
+    // Per-tool usage (when to turn the head vs. take a photo, angle ranges, the OK/NG
+    // confirmation) lives in each tool's own description, which is sent in the
+    // function definitions -- no need to repeat it here. Keep only the behavioral
+    // nudge that isn't expressible per-tool: don't refuse for lack of a camera.
     instructions +=
-        "\n\nYou are running inside a physical Stack-chan robot with a camera and head servos. "
-        "When the user asks what you can see, asks to take a photo, or asks you to look in a direction, "
-        "use the provided camera/head function tool instead of saying you do not have camera capability. "
-        "Examples: `何か見える？` -> use stackchan_take_photo; "
-        "`右斜め上を見てみて` -> use stackchan_look_and_take_photo with yaw 45 and pitch 45; "
-        "`真後ろを見てみて` -> yaw 128; `90度左を見てみて` -> yaw -90. "
-        "The device will always show the captured image to the user and wait for OK/NG before you receive the visual result.";
+        "\n\nYou have a camera and head servos via the provided tools; never say you lack a camera.";
     cJSON_AddStringToObject(session, "instructions", instructions.c_str());
 
     cJSON* output_modalities = cJSON_AddArrayToObject(session, "output_modalities");
@@ -389,14 +416,12 @@ bool GptRealtimeProtocol::SendGrokSessionUpdate()
     cJSON* session = cJSON_AddObjectToObject(root, "session");
     cJSON_AddStringToObject(session, "voice", voice_.c_str());
     std::string instructions = instructions_;
+    // Per-tool usage (when to turn the head vs. take a photo, angle ranges, the OK/NG
+    // confirmation) lives in each tool's own description, which is sent in the
+    // function definitions -- no need to repeat it here. Keep only the behavioral
+    // nudge that isn't expressible per-tool: don't refuse for lack of a camera.
     instructions +=
-        "\n\nYou are running inside a physical Stack-chan robot with a camera and head servos. "
-        "When the user asks what you can see, asks to take a photo, or asks you to look in a direction, "
-        "use the provided camera/head function tool instead of saying you do not have camera capability. "
-        "Examples: `何か見える？` -> use stackchan_take_photo; "
-        "`右斜め上を見てみて` -> use stackchan_look_and_take_photo with yaw 45 and pitch 45; "
-        "`真後ろを見てみて` -> yaw 128; `90度左を見てみて` -> yaw -90. "
-        "The device will always show the captured image to the user and wait for OK/NG before you receive the visual description.";
+        "\n\nYou have a camera and head servos via the provided tools; never say you lack a camera.";
     cJSON_AddStringToObject(session, "instructions", instructions.c_str());
 
     cJSON* turn_detection = cJSON_AddObjectToObject(session, "turn_detection");
@@ -627,62 +652,42 @@ bool GptRealtimeProtocol::SendImageMessage(const std::string& data_uri, const st
 
 void GptRealtimeProtocol::AddStackChanFunctionTools(cJSON* session)
 {
+    // Expose the MCP server's AI-visible tools as realtime function tools, so there
+    // is a single source of tool definitions. Each MCP tool's name is sanitized
+    // (dots -> underscores) for the wire; its inputSchema properties/required map
+    // directly onto the function "parameters" object.
     cJSON* tools = cJSON_AddArrayToObject(session, "tools");
 
-    cJSON* take_photo = cJSON_CreateObject();
-    cJSON_AddStringToObject(take_photo, "type", "function");
-    cJSON_AddStringToObject(take_photo, "name", "stackchan_take_photo");
-    cJSON_AddStringToObject(
-        take_photo, "description",
-        "Take a camera photo with mandatory touch-display OK/NG user confirmation, then return a concise visual description. "
-        "Use this whenever the user asks what Stack-chan can see, asks to look around, or asks to take a photo.");
-    cJSON* take_params = cJSON_AddObjectToObject(take_photo, "parameters");
-    cJSON_AddStringToObject(take_params, "type", "object");
-    cJSON* take_props = cJSON_AddObjectToObject(take_params, "properties");
-    cJSON* take_question = cJSON_AddObjectToObject(take_props, "question");
-    cJSON_AddStringToObject(take_question, "type", "string");
-    cJSON_AddStringToObject(take_question, "description", "The user's visual question or request.");
-    cJSON* take_required = cJSON_AddArrayToObject(take_params, "required");
-    cJSON_AddItemToArray(take_required, cJSON_CreateString("question"));
-    cJSON_AddItemToArray(tools, take_photo);
+    int exposed = 0;
+    for (McpTool* tool : McpServer::GetInstance().tools()) {
+        if (tool->user_only()) {
+            continue;  // user-only/system tools stay invisible to the model
+        }
 
-    cJSON* look_photo = cJSON_CreateObject();
-    cJSON_AddStringToObject(look_photo, "type", "function");
-    cJSON_AddStringToObject(look_photo, "name", "stackchan_look_and_take_photo");
-    cJSON_AddStringToObject(
-        look_photo, "description",
-        "Turn Stack-chan's head to a direction, wait briefly, then take a confirmed camera photo and return a visual description. "
-        "Yaw degrees: negative is Stack-chan's left, positive is right. Pitch degrees: 0 forward/low, 45 diagonal up, 90 max up. "
-        "Examples: right-up yaw=45 pitch=45; directly behind yaw=128 pitch=20; 90 degrees left yaw=-90 pitch=20.");
-    cJSON* look_params = cJSON_AddObjectToObject(look_photo, "parameters");
-    cJSON_AddStringToObject(look_params, "type", "object");
-    cJSON* look_props = cJSON_AddObjectToObject(look_params, "properties");
-    cJSON* yaw = cJSON_AddObjectToObject(look_props, "yaw");
-    cJSON_AddStringToObject(yaw, "type", "integer");
-    cJSON_AddNumberToObject(yaw, "minimum", -128);
-    cJSON_AddNumberToObject(yaw, "maximum", 128);
-    cJSON* pitch = cJSON_AddObjectToObject(look_props, "pitch");
-    cJSON_AddStringToObject(pitch, "type", "integer");
-    cJSON_AddNumberToObject(pitch, "minimum", 0);
-    cJSON_AddNumberToObject(pitch, "maximum", 90);
-    cJSON* speed = cJSON_AddObjectToObject(look_props, "speed");
-    cJSON_AddStringToObject(speed, "type", "integer");
-    cJSON_AddNumberToObject(speed, "minimum", 100);
-    cJSON_AddNumberToObject(speed, "maximum", 1000);
-    cJSON_AddNumberToObject(speed, "default", 250);
-    cJSON* settle_ms = cJSON_AddObjectToObject(look_props, "settle_ms");
-    cJSON_AddStringToObject(settle_ms, "type", "integer");
-    cJSON_AddNumberToObject(settle_ms, "minimum", 0);
-    cJSON_AddNumberToObject(settle_ms, "maximum", 3000);
-    cJSON_AddNumberToObject(settle_ms, "default", 800);
-    cJSON* look_question = cJSON_AddObjectToObject(look_props, "question");
-    cJSON_AddStringToObject(look_question, "type", "string");
-    cJSON_AddStringToObject(look_question, "description", "The user's visual question or request.");
-    cJSON* look_required = cJSON_AddArrayToObject(look_params, "required");
-    cJSON_AddItemToArray(look_required, cJSON_CreateString("yaw"));
-    cJSON_AddItemToArray(look_required, cJSON_CreateString("pitch"));
-    cJSON_AddItemToArray(look_required, cJSON_CreateString("question"));
-    cJSON_AddItemToArray(tools, look_photo);
+        cJSON* fn = cJSON_CreateObject();
+        cJSON_AddStringToObject(fn, "type", "function");
+        cJSON_AddStringToObject(fn, "name", SanitizeToolName(tool->name()).c_str());
+        cJSON_AddStringToObject(fn, "description", tool->description().c_str());
+
+        cJSON* params = cJSON_AddObjectToObject(fn, "parameters");
+        cJSON_AddStringToObject(params, "type", "object");
+
+        cJSON* props = cJSON_Parse(tool->properties().to_json().c_str());
+        cJSON_AddItemToObject(params, "properties", props != nullptr ? props : cJSON_CreateObject());
+
+        auto required = tool->properties().GetRequired();
+        if (!required.empty()) {
+            cJSON* required_array = cJSON_AddArrayToObject(params, "required");
+            for (const auto& name : required) {
+                cJSON_AddItemToArray(required_array, cJSON_CreateString(name.c_str()));
+            }
+        }
+
+        cJSON_AddItemToArray(tools, fn);
+        ++exposed;
+    }
+
+    ESP_LOGI(TAG, "Exposed %d MCP tools as realtime functions", exposed);
 }
 
 bool GptRealtimeProtocol::DescribeImageWithGrok(const std::string& data_uri, std::string& description)
@@ -958,30 +963,6 @@ void GptRealtimeProtocol::RememberFunctionCallName(const cJSON* root)
     }
 }
 
-bool GptRealtimeProtocol::ExecuteStackChanCameraTool(const char* function_name, const cJSON* args, std::string& output)
-{
-    if (strcmp(function_name, "stackchan_take_photo") == 0) {
-        auto question = cJSON_GetObjectItem(args, "question");
-        return CaptureImageForFunctionTool(false, 0, 20, 250, 0,
-                                           cJSON_IsString(question) ? question->valuestring : "What is visible?",
-                                           output);
-    }
-    if (strcmp(function_name, "stackchan_look_and_take_photo") == 0) {
-        auto yaw = cJSON_GetObjectItem(args, "yaw");
-        auto pitch = cJSON_GetObjectItem(args, "pitch");
-        auto speed = cJSON_GetObjectItem(args, "speed");
-        auto settle_ms = cJSON_GetObjectItem(args, "settle_ms");
-        auto question = cJSON_GetObjectItem(args, "question");
-        return CaptureImageForFunctionTool(
-            true, cJSON_IsNumber(yaw) ? yaw->valueint : 0, cJSON_IsNumber(pitch) ? pitch->valueint : 20,
-            cJSON_IsNumber(speed) ? speed->valueint : 250, cJSON_IsNumber(settle_ms) ? settle_ms->valueint : 800,
-            cJSON_IsString(question) ? question->valuestring : "What is visible?", output);
-    }
-
-    output = "{\"success\":false,\"error\":\"Unknown function\"}";
-    return false;
-}
-
 void GptRealtimeProtocol::HandleFunctionCall(const cJSON* root)
 {
     auto name = cJSON_GetObjectItem(root, "name");
@@ -1044,20 +1025,34 @@ void GptRealtimeProtocol::DispatchFunctionCall(const std::string& call_id, const
         if (args == nullptr) {
             args = cJSON_CreateObject();
         }
+        // Route every function call through the MCP server so tool definitions and
+        // execution share one implementation. The wire name is the dot->underscore
+        // sanitized MCP name; resolve it back, then invoke. Camera tools run their
+        // MCP capture/confirm flow and produce a Grok vision description via the
+        // explain delegate registered in OpenAudioChannel().
+        std::string mcp_name = ResolveMcpToolName(function_name);
+        bool is_camera = IsCameraToolName(mcp_name);
         std::string output;
         bool ok = false;
         try {
-            ESP_LOGI(TAG, "Execute function call: call_id=%s name=%s args=%s", call_id.c_str(),
-                     function_name.c_str(), arguments_json.c_str());
-            ok = ExecuteStackChanCameraTool(function_name.c_str(), args, output);
+            ESP_LOGI(TAG, "Execute function call: call_id=%s name=%s mcp=%s args=%s", call_id.c_str(),
+                     function_name.c_str(), mcp_name.c_str(), arguments_json.c_str());
+            if (mcp_name.empty()) {
+                throw std::runtime_error("Unknown function: " + function_name);
+            }
+            output = McpServer::GetInstance().CallToolSync(mcp_name, args);
+            ok = true;
         } catch (const std::exception& e) {
-            output = std::string("{\"success\":false,\"error\":\"") + e.what() + "\"}";
+            ok = false;
+            cJSON* err = cJSON_CreateObject();
+            cJSON_AddBoolToObject(err, "success", false);
+            cJSON_AddStringToObject(err, "error", e.what());
+            char* err_json = cJSON_PrintUnformatted(err);
+            output.assign(err_json);
+            cJSON_free(err_json);
+            cJSON_Delete(err);
         }
         cJSON_Delete(args);
-
-        if (!ok && output.empty()) {
-            output = "{\"success\":false,\"error\":\"Function failed\"}";
-        }
 
         // Drop any mic audio server-VAD buffered just before we suppressed input,
         // so it can't fire a stray turn that races our function_call_output below.
@@ -1082,29 +1077,31 @@ void GptRealtimeProtocol::DispatchFunctionCall(const std::string& call_id, const
         // intentionally do NOT send response.create. The visual description is now in the
         // conversation via function_call_output, so the user's next spoken turn makes
         // Grok describe the photo from context. Prompt the user to ask.
-        std::string desc;
-        cJSON* parsed = cJSON_Parse(output.c_str());
-        if (parsed != nullptr) {
-            cJSON* vd = cJSON_GetObjectItem(parsed, "visual_description");
-            if (cJSON_IsString(vd)) {
-                desc = vd->valuestring;
+        //
+        // Only camera/photo tools get a follow-up hint + chime. Other tools (head
+        // turn, LED, reminders, volume, ...) just let the model speak its reply -- a
+        // "what did you see?" nudge would make no sense after e.g. a head turn.
+        // Keep each line short: the avatar bubble caps at 2 lines and only auto-scrolls
+        // overflow for streamed replies (onSpeechComplete), not one-shot system text.
+        // - OK: the caption is ready but Grok won't speak it on its own (see above),
+        //   so nudge the user to ask about the photo.
+        // - NG: the user tapped reject, so there is no photo to ask about -- just
+        //   acknowledge instead of telling them to ask "what did you see?".
+        if (is_camera) {
+            auto display = Board::GetInstance().GetDisplay();
+            if (display != nullptr) {
+                if (ok) {
+                    display->SetChatMessage("system", "「何が見えた？」と聞いてね");
+                } else if (output.find("rejected") != std::string::npos) {
+                    display->SetChatMessage("system", "わかった、やめとくね");
+                } else {
+                    display->SetChatMessage("system", "うまく撮れなかったみたい");
+                }
             }
-            cJSON_Delete(parsed);
+            hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
         }
-        // Caption is ready but Grok won't speak it on its own (see above). Prompt the
-        // user to ask, with BOTH a screen message and a notification chime so it's
-        // noticeable without watching the display.
-        // Keep this short: the avatar bubble caps at 2 lines and only auto-scrolls
-        // overflow for streamed replies (onSpeechComplete), not one-shot system text,
-        // so a 3-line hint would clip. The chime already signals "done"; the text just
-        // tells the user to ask.
-        auto display = Board::GetInstance().GetDisplay();
-        if (display != nullptr) {
-            display->SetChatMessage("system", "「何が見えた？」と聞いてね");
-        }
-        hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
-        ESP_LOGI(TAG, "Function output sent: call_id=%s output_ok=%d desc_len=%u output=%.160s",
-                 call_id.c_str(), out_ok, (unsigned)desc.size(), output.c_str());
+        ESP_LOGI(TAG, "Function output sent: call_id=%s output_ok=%d camera=%d output=%.160s",
+                 call_id.c_str(), out_ok, static_cast<int>(is_camera), output.c_str());
 
         {
             std::lock_guard<std::mutex> lock(function_call_mutex_);
@@ -1151,106 +1148,6 @@ bool GptRealtimeProtocol::HandleFunctionCallsFromResponseDone(const cJSON* root)
     // Return true when the response carried function calls so the caller skips the
     // normal terminal handling; the response.create is sent by the worker.
     return handled;
-}
-
-bool GptRealtimeProtocol::CaptureImageForFunctionTool(bool move_head, int yaw, int pitch, int speed, int settle_ms,
-                                                      const std::string& question, std::string& output)
-{
-    auto& board = Board::GetInstance();
-    auto camera = board.GetCamera();
-    auto display = dynamic_cast<LvglDisplay*>(board.GetDisplay());
-    if (camera == nullptr || display == nullptr) {
-        output = "{\"success\":false,\"error\":\"Camera or display is unavailable\"}";
-        return false;
-    }
-
-    if (move_head) {
-        auto& motion = GetStackChan().motion();
-        motion.setModifyLock(true);
-        {
-            DisplayLockGuard lock(board.GetDisplay());
-            ESP_LOGI(TAG, "Move head for camera tool: yaw=%d pitch=%d speed=%d settle_ms=%d", yaw, pitch, speed,
-                     settle_ms);
-            MoveStackChanHeadFromJson(yaw, pitch, speed);
-        }
-        WaitForHeadToSettle(settle_ms);
-        motion.setModifyLock(false);
-    }
-
-    TaskPriorityReset priority_reset(1);
-    if (!camera->Capture()) {
-        output = "{\"success\":false,\"error\":\"Failed to capture photo\"}";
-        return false;
-    }
-
-    bool accepted = false;
-    SemaphoreHandle_t done = xSemaphoreCreateBinary();
-    if (done == nullptr) {
-        display->SetPreviewImage(nullptr);
-        output = "{\"success\":false,\"error\":\"Failed to create photo review semaphore\"}";
-        return false;
-    }
-    display->ShowImageConfirmation([done, &accepted](bool ok) {
-        accepted = ok;
-        xSemaphoreGive(done);
-    });
-    xSemaphoreTake(done, portMAX_DELAY);
-    vSemaphoreDelete(done);
-    if (!accepted) {
-        display->SetPreviewImage(nullptr);
-        output = "{\"success\":false,\"error\":\"User rejected the photo\"}";
-        return false;
-    }
-
-    std::string data_uri;
-    if (!camera->EncodeToJpegDataUri(data_uri, 80)) {
-        display->SetPreviewImage(nullptr);
-        output = "{\"success\":false,\"error\":\"Failed to encode photo\"}";
-        return false;
-    }
-    display->SetPreviewImage(nullptr);
-
-    if (provider_ == RealtimeProvider::OpenAi) {
-        const std::string note =
-            "The user approved this camera photo for the current function call. Use it as visual context to answer the user's question: " +
-            question;
-        if (!SendImageMessage(data_uri, note)) {
-            output = "{\"success\":false,\"error\":\"Failed to attach photo to conversation\"}";
-            return false;
-        }
-
-        cJSON* result = cJSON_CreateObject();
-        cJSON_AddBoolToObject(result, "success", true);
-        cJSON_AddStringToObject(result, "question", question.c_str());
-        cJSON_AddStringToObject(result, "result",
-                                "The approved camera photo was attached to the conversation as visual context.");
-        char* json = cJSON_PrintUnformatted(result);
-        output.assign(json);
-        cJSON_free(json);
-        cJSON_Delete(result);
-        return true;
-    }
-
-    // The vision query takes a few seconds; show the user it is in progress so the
-    // device doesn't look frozen while waiting on the API.
-    display->SetChatMessage("system", "画像を確認しています…");
-
-    std::string description;
-    if (!DescribeImageWithGrok(data_uri, description)) {
-        display->SetChatMessage("system", "画像の確認に失敗しました");
-        output = "{\"success\":false,\"error\":\"Failed to describe photo\"}";
-        return false;
-    }
-
-    cJSON* result = cJSON_CreateObject();
-    cJSON_AddBoolToObject(result, "success", true);
-    cJSON_AddStringToObject(result, "question", question.c_str());
-    cJSON_AddStringToObject(result, "visual_description", description.c_str());
-    char* json = cJSON_PrintUnformatted(result);
-    output.assign(json);
-    cJSON_free(json);
-    cJSON_Delete(result);
-    return true;
 }
 
 void GptRealtimeProtocol::HandleAudioDelta(const cJSON* root)

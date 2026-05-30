@@ -1,6 +1,10 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <cmath>
+#include <cstdint>
+#include "esp_dsp.h"
+#include <hal/board/hal_bridge.h>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -299,6 +303,7 @@ void AudioService::AudioInputTask() {
             if (ReadAudioData(data, 16000, samples)) {
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
                     wake_word_->Feed(data);
+                    MaybeEmitSpectrum(data);  // [TEMP DIAG] idle music survey
                 }
                 if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
                     audio_processor_->Feed(std::move(data));
@@ -688,6 +693,310 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     });
     demuxer->Reset();
     demuxer->Process(buf, size);
+}
+
+// [TEMP DIAG] Idle kick monitor: band-pass the mic to the kick band (~40-75 Hz) with a
+// biquad and stream the per-frame energy ("[KICK]<m><hh>") at the mic frame rate
+// (~100 Hz) so a PC tool / the on-device beat detector can run SHARP onset detection.
+// A short per-frame energy keeps transients crisp (unlike a long FFT window, which
+// smooths the envelope and erases the onset). Idle only; remove when done.
+void AudioService::MaybeEmitSpectrum(const std::vector<int16_t>& frame) {
+    if (spec_disabled_ || frame.empty()) {
+        return;
+    }
+    if (!spec_inited_) {
+        // Band-pass centered ~55 Hz, Q ~1.5 -> roughly 40-75 Hz.
+        if (dsps_biquad_gen_bpf_f32(spec_kick_coeffs_, 55.0f / 16000.0f, 1.5f) != ESP_OK) {
+            ESP_LOGW(TAG, "[KICK] biquad init failed; disabling kick monitor");
+            spec_disabled_ = true;
+            return;
+        }
+        spec_kick_w_[0] = spec_kick_w_[1] = 0.0f;
+        spec_inited_ = true;
+    }
+
+    int nsm = (int)frame.size();
+    float in[320], out[320];
+    if (nsm > 320) nsm = 320;
+    for (int i = 0; i < nsm; ++i) {
+        in[i] = (float)frame[i] / 32768.0f;
+    }
+    dsps_biquad_f32(in, out, nsm, spec_kick_coeffs_, spec_kick_w_);
+
+    float ms = 0.0f;
+    for (int i = 0; i < nsm; ++i) {
+        ms += out[i] * out[i];
+    }
+    ms /= (float)nsm;
+    float db = 10.0f * log10f(ms + 1e-12f);
+    int v = (int)((db + 90.0f) / 70.0f * 255.0f);  // map ~[-90,-20] dB -> 0..255
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+
+    // ([KICK] serial stream removed now that detection runs on-device; re-enable with
+    //  printf("[KICK]%c%02x\n", mv?'1':'0', v); if the PC viewer is needed again.)
+    BeatDetectStep(v, hal_bridge::servo_is_moving());
+}
+
+// Beat detector constants (tuned on the PC preview).
+static constexpr int kBeatDecimate    = 3;          // 100 Hz -> ~33 Hz detection rate
+static constexpr int kBeatHistN       = 24;
+static constexpr int kBeatFluxN       = 3;          // local-mean baseline (~90 ms)
+static constexpr float kBeatThreshK   = 1.0f;
+static constexpr float kBeatThreshFloor = 2.5f;
+static constexpr float kBeatLockSpread = 0.35f;  // lock readily; confidence dims wrong beats
+static constexpr int64_t kBeatRefractoryUs = 180000;   // 180 ms -> <= ~330 BPM
+static constexpr int64_t kBeatMaxIntervalUs = 2000000; // ignore gaps > 2 s as non-beats
+static constexpr int64_t kBeatTimeoutUs = 2500000;     // unlock after 2.5 s with no kick
+static constexpr int kBeatIntervalsN  = 8;
+
+static void beat_isort(int64_t* a, int n) {
+    for (int i = 1; i < n; ++i) {
+        int64_t k = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > k) { a[j + 1] = a[j]; --j; }
+        a[j + 1] = k;
+    }
+}
+
+void AudioService::BeatDetectStep(int energy, bool moving) {
+    // 1) Decimate the 100 Hz energy to ~33 Hz (smoother single peaks).
+    beat_.dec_sum += (float)energy;
+    if (++beat_.dec_cnt < kBeatDecimate) {
+        return;
+    }
+    float sample = beat_.dec_sum / (float)beat_.dec_cnt;
+    beat_.dec_sum = 0.0f;
+    beat_.dec_cnt = 0;
+
+    // 2) Flux vs a short local mean; adaptive noise from the history.
+    float baseline = sample;
+    if (beat_.hist_filled >= kBeatFluxN) {
+        float s = 0.0f;
+        for (int j = 0; j < kBeatFluxN; ++j) {
+            int idx = (beat_.hist_pos - 1 - j + kBeatHistN) % kBeatHistN;
+            s += beat_.hist[idx];
+        }
+        baseline = s / (float)kBeatFluxN;
+    }
+    float mean = 0.0f, var = 0.0f;
+    if (beat_.hist_filled > 0) {
+        for (int j = 0; j < beat_.hist_filled; ++j) mean += beat_.hist[j];
+        mean /= (float)beat_.hist_filled;
+        for (int j = 0; j < beat_.hist_filled; ++j) { float d = beat_.hist[j] - mean; var += d * d; }
+        var /= (float)beat_.hist_filled;
+    }
+    float noise = sqrtf(var);
+    float flux  = sample - baseline;
+
+    beat_.hist[beat_.hist_pos] = sample;
+    beat_.hist_pos = (beat_.hist_pos + 1) % kBeatHistN;
+    if (beat_.hist_filled < kBeatHistN) beat_.hist_filled++;
+
+    int64_t now = esp_timer_get_time();
+
+    // 3) Unlock if the music stopped (no kick for a while).
+    if (beat_.locked && beat_.last_onset_us != 0 && (now - beat_.last_onset_us) > kBeatTimeoutUs) {
+        beat_.locked = false;
+        beat_.intervals_cnt = 0;
+        hal_bridge::beat_publish(0, 0, false, 0.0f);
+        ESP_LOGI(TAG, "[BEAT] UNLOCK");
+    }
+
+    if (moving) {
+        return;  // servo noise: keep the baseline fresh but don't fire onsets
+    }
+
+    // 4) Onset?
+    float thr = (kBeatThreshK * noise > kBeatThreshFloor) ? (kBeatThreshK * noise) : kBeatThreshFloor;
+    if (flux <= thr || (now - beat_.last_onset_us) <= kBeatRefractoryUs) {
+        return;
+    }
+
+    int64_t prev = beat_.last_onset_us;
+    beat_.last_onset_us = now;
+    if (prev == 0) {
+        return;  // first onset: no interval yet
+    }
+    int64_t interval = now - prev;
+    if (interval <= 0 || interval > kBeatMaxIntervalUs) {
+        return;
+    }
+
+    // 5) Track tempo: octave-fold recent intervals toward their median, take the median.
+    beat_.intervals[beat_.intervals_pos] = interval;
+    beat_.intervals_pos = (beat_.intervals_pos + 1) % kBeatIntervalsN;
+    if (beat_.intervals_cnt < kBeatIntervalsN) beat_.intervals_cnt++;
+    if (beat_.intervals_cnt < 4) {
+        return;
+    }
+    int m = beat_.intervals_cnt;
+    int64_t s1[kBeatIntervalsN];
+    for (int j = 0; j < m; ++j) s1[j] = beat_.intervals[j];
+    beat_isort(s1, m);
+    int64_t ref = s1[m / 2];
+    int64_t folded[kBeatIntervalsN];
+    for (int j = 0; j < m; ++j) {
+        int64_t b = beat_.intervals[j];
+        while (b < ref * 2 / 3) b *= 2;
+        while (b > ref * 3 / 2) b /= 2;
+        folded[j] = b;
+    }
+    beat_isort(folded, m);
+    int64_t period = folded[m / 2];
+    if (period <= 0) {
+        return;
+    }
+    float spread = (float)(folded[m - 1] - folded[0]) / (float)period;
+    // Confidence 0..1 from interval consistency: tight intervals -> 1 (bright/correct),
+    // loose -> 0 (dim, so a wrong beat is barely noticeable).
+    float conf = 1.0f - spread / kBeatLockSpread;
+    if (conf < 0.0f) conf = 0.0f;
+    if (conf > 1.0f) conf = 1.0f;
+
+    // 6) Lock / PLL the phase, then publish for the LED task.
+    if (!beat_.locked) {
+        if (spread < kBeatLockSpread) {
+            beat_.locked    = true;
+            beat_.period_us = period;
+            beat_.anchor_us = now;
+            hal_bridge::beat_publish(beat_.anchor_us, beat_.period_us, true, conf);
+            ESP_LOGI(TAG, "[BEAT] LOCK ~%d bpm conf=%.2f", (int)(60000000LL / period), conf);
+        }
+        return;
+    }
+    beat_.period_us = period;
+    // Nudge the phase anchor toward this onset (gentle PLL) so it stays aligned
+    // without resetting every beat (the LED task derives beats from anchor+k*period).
+    int64_t kk = (now - beat_.anchor_us + beat_.period_us / 2) / beat_.period_us;
+    int64_t expected = beat_.anchor_us + kk * beat_.period_us;
+    beat_.anchor_us += (now - expected) / 8;
+    hal_bridge::beat_publish(beat_.anchor_us, beat_.period_us, true, conf);
+}
+
+void AudioService::PlayPcm(const int16_t* samples, size_t count, int sample_rate) {
+    if (samples == nullptr || count == 0) {
+        return;
+    }
+    if (!codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
+    auto packet = std::make_unique<AudioStreamPacket>();
+    packet->sample_rate = sample_rate;
+    packet->frame_duration = 60;
+    packet->format = AudioStreamFormat::kPcm;
+    packet->payload.resize(count * sizeof(int16_t));
+    std::memcpy(packet->payload.data(), samples, packet->payload.size());
+    // Don't block the caller (often a state-change handler); drop if the queue is full.
+    PushPacketToDecodeQueue(std::move(packet), false);
+}
+
+// Synthesize a walkie-talkie squelch "ザザッ/サーッ": high-pass-filtered white noise
+// shaped as a BURST (quick attack, flat sustain, quick release) so it reads as static,
+// not a percussive clap. esp-dsp's high-pass biquad gives the bright hiss; an optional
+// amplitude modulation adds the buzzy "ザザ" rasp. Output is normalized to a fixed peak
+// so loudness is predictable regardless of the filter's gain.
+void AudioService::SynthSquelchCue(std::vector<int16_t>& out, int sample_rate, int duration_ms, float amplitude,
+                                   bool rasp) {
+    int n = (int)((int64_t)sample_rate * duration_ms / 1000);
+    if (n <= 0) {
+        out.clear();
+        return;
+    }
+    std::vector<float> noise(n);
+    std::vector<float> filtered(n);
+
+    // White noise via xorshift32 (fixed seed -> consistent cue), mapped to [-1, 1).
+    uint32_t s = 0x1234567u;
+    for (int i = 0; i < n; ++i) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        noise[i] = ((float)(s & 0x00FFFFFFu) / (float)0x00800000u) - 1.0f;
+    }
+
+    // High-pass the noise -> bright "シャー" hiss (squelch noise is high-frequency).
+    // Two cascaded stages make the cutoff steeper / the timbre brighter.
+    float coeffs[5];
+    float w1[2] = {0.0f, 0.0f};
+    float w2[2] = {0.0f, 0.0f};
+    float fc = 2000.0f / (float)sample_rate;  // normalized cutoff
+    dsps_biquad_gen_hpf_f32(coeffs, fc, 0.707f);
+    dsps_biquad_f32(noise.data(), filtered.data(), n, coeffs, w1);
+    dsps_biquad_f32(filtered.data(), filtered.data(), n, coeffs, w2);
+
+    // Attack/Sustain/Release envelope: a flat-topped burst, NOT a front-loaded decay.
+    // The sustain is what makes it a "static burst" instead of a clap.
+    int attack  = sample_rate * 8 / 1000;
+    int release = sample_rate * 45 / 1000;
+    if (attack < 1) attack = 1;
+    if (release < 1) release = 1;
+    if (attack + release > n) {
+        attack  = n / 4;
+        release = n / 4;
+    }
+    int sustain_end = n - release;
+    for (int i = 0; i < n; ++i) {
+        float env;
+        if (i < attack) {
+            env = (float)i / (float)attack;
+        } else if (i < sustain_end) {
+            env = 1.0f;
+        } else {
+            env = (float)(n - i) / (float)release;
+        }
+        filtered[i] *= env;
+    }
+
+    // Optional amplitude modulation -> buzzy "ザザ" rasp (smooth hiss when off).
+    if (rasp) {
+        float wam = 2.0f * (float)M_PI * 90.0f / (float)sample_rate;  // ~90 Hz buzz
+        for (int i = 0; i < n; ++i) {
+            filtered[i] *= 0.55f + 0.45f * sinf(wam * (float)i);
+        }
+    }
+
+    // Normalize to the requested peak amplitude, then convert to int16.
+    float peak = 1e-6f;
+    for (int i = 0; i < n; ++i) {
+        float a = fabsf(filtered[i]);
+        if (a > peak) peak = a;
+    }
+    float gain = amplitude / peak;
+    out.resize(n);
+    for (int i = 0; i < n; ++i) {
+        float v = filtered[i] * gain;
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        out[i] = (int16_t)(v * 30000.0f);
+    }
+}
+
+void AudioService::PlayCue(Cue cue) {
+    int sample_rate = codec_ != nullptr ? codec_->output_sample_rate() : 24000;
+    if (cue_sample_rate_ != sample_rate) {
+        cue_turn_end_pcm_.clear();
+        cue_processing_pcm_.clear();
+        cue_sample_rate_ = sample_rate;
+    }
+
+    std::vector<int16_t>* pcm = nullptr;
+    if (cue == Cue::kTurnEnd) {
+        if (cue_turn_end_pcm_.empty()) {
+            SynthSquelchCue(cue_turn_end_pcm_, sample_rate, 180, 0.5f, /*rasp=*/true);
+        }
+        pcm = &cue_turn_end_pcm_;
+    } else {
+        if (cue_processing_pcm_.empty()) {
+            SynthSquelchCue(cue_processing_pcm_, sample_rate, 50, 0.3f, /*rasp=*/false);
+        }
+        pcm = &cue_processing_pcm_;
+    }
+    if (pcm != nullptr && !pcm->empty()) {
+        PlayPcm(pcm->data(), pcm->size(), sample_rate);
+    }
 }
 
 bool AudioService::IsIdle() {

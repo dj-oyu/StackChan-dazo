@@ -134,6 +134,15 @@ public:
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
+
+    // Short synthesized UI sound cues for turn-taking. kTurnEnd is the walkie-talkie
+    // "squelch tail" played when the assistant finishes (your turn); kProcessing is a
+    // shorter tick. Waveforms are synthesized once (esp-dsp filtered noise) and cached.
+    enum class Cue { kTurnEnd, kProcessing };
+    void PlayCue(Cue cue);
+    // Play a raw int16 mono PCM buffer through the speaker, independent of device
+    // state (unlike incoming-audio which only plays while speaking).
+    void PlayPcm(const int16_t* samples, size_t count, int sample_rate);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
@@ -195,6 +204,41 @@ private:
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
+    void SynthSquelchCue(std::vector<int16_t>& out, int sample_rate, int duration_ms, float amplitude, bool rasp);
+
+    // Cached synthesized cue waveforms (lazily built at the codec output rate).
+    std::vector<int16_t> cue_turn_end_pcm_;
+    std::vector<int16_t> cue_processing_pcm_;
+    int cue_sample_rate_ = 0;
+
+    // [TEMP DIAG] Idle kick monitor: band-pass (40-75 Hz) the mic and stream the
+    // per-frame energy over the serial console ("[KICK]<m><hh>", m = servo-moving
+    // flag, hh = energy byte) at the ~100 Hz mic frame rate, so a PC tool (and later
+    // the on-device beat detector) can run sharp onset detection. Idle only.
+    void MaybeEmitSpectrum(const std::vector<int16_t>& frame);
+    bool spec_inited_ = false;
+    bool spec_disabled_ = false;
+    float spec_kick_coeffs_[5] = {0};  // 40-75 Hz band-pass biquad coefficients
+    float spec_kick_w_[2] = {0};       // biquad delay line (persists across frames)
+
+    // On-device beat detector: decimate the 100 Hz kick energy, detect kick onsets,
+    // octave-fold + median the intervals into a tempo, and PLL the beat phase. Result
+    // is published via hal_bridge for the LED pulse. Runs in the audio task.
+    void BeatDetectStep(int energy, bool moving);
+    struct BeatDet {
+        float dec_sum = 0.0f;
+        int dec_cnt = 0;
+        float hist[24] = {0};      // decimated energy history (flux baseline + noise)
+        int hist_pos = 0;
+        int hist_filled = 0;
+        int64_t last_onset_us = 0;
+        int64_t intervals[8] = {0};
+        int intervals_cnt = 0;
+        int intervals_pos = 0;
+        int64_t anchor_us = 0;     // PLL phase reference
+        int64_t period_us = 0;
+        bool locked = false;
+    } beat_;
 };
 
 #endif

@@ -14,6 +14,7 @@
 #include <application.h>
 #include <board.h>
 #include <display.h>
+#include <stackchan/stackchan.h>
 #include <mutex>
 #include <assets.h>
 #include <settings.h>
@@ -143,6 +144,29 @@ void app_play_sound(const std::string_view& sound)
 {
     auto& app = Application::GetInstance();
     app.PlaySound(sound);
+}
+
+bool servo_is_moving()
+{
+    return GetStackChan().motion().isMoving();
+}
+
+static BeatState s_beat_state;
+static std::mutex s_beat_mutex;
+
+void beat_publish(int64_t anchor_us, int64_t period_us, bool locked, float confidence)
+{
+    std::lock_guard<std::mutex> lock(s_beat_mutex);
+    s_beat_state.anchor_us  = anchor_us;
+    s_beat_state.period_us  = period_us;
+    s_beat_state.locked     = locked;
+    s_beat_state.confidence = confidence;
+}
+
+BeatState beat_get()
+{
+    std::lock_guard<std::mutex> lock(s_beat_mutex);
+    return s_beat_state;
 }
 
 }  // namespace hal_bridge

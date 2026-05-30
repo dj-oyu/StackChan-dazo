@@ -326,6 +326,20 @@ public:
     void ParseMessage(const cJSON* json);
     void ParseMessage(const std::string& message);
 
+    // Registered tools (AI-visible and user-only). Lets other transports (e.g. the
+    // Grok realtime function-calling protocol) expose the same tool definitions
+    // instead of maintaining a duplicate list.
+    const std::vector<McpTool*>& tools() const { return tools_; }
+
+    // Synchronously invoke a tool by its exact registered name, parsing `arguments`
+    // (a cJSON object, may be null) into the tool's PropertyList the same way
+    // tools/call does. Returns the plain text result of the tool (the inner text
+    // content of the MCP result, or the stringified value). Throws std::runtime_error
+    // on unknown tool, missing/invalid argument, or if the tool callback throws.
+    // Must be called from a context where blocking is acceptable (the camera tools
+    // block on a touch confirmation); callers already on the app loop are fine.
+    std::string CallToolSync(const std::string& tool_name, const cJSON* arguments);
+
 private:
     McpServer();
     ~McpServer();

@@ -64,4 +64,20 @@ uint8_t board_get_speaker_volume();
 
 void app_play_sound(const std::string_view& sound);
 
+// True while the head servos are mid-move. Lets audio-side code (e.g. the idle
+// music survey / future beat detector) ignore frames contaminated by servo noise
+// using the known motion state instead of trying to detect it acoustically.
+bool servo_is_moving();
+
+// Beat-detector state shared from the audio task (producer) to the stackchan update
+// task (consumer, drives the LED pulse). Beats occur at anchor_us + k*period_us.
+struct BeatState {
+    int64_t anchor_us = 0;   // time of a recent beat (phase reference, esp_timer us)
+    int64_t period_us = 0;   // beat period in microseconds
+    bool locked = false;     // true while a stable tempo is tracked
+    float confidence = 0.0f; // 0..1 tempo lock confidence (drives LED brightness)
+};
+void beat_publish(int64_t anchor_us, int64_t period_us, bool locked, float confidence);
+BeatState beat_get();
+
 }  // namespace hal_bridge

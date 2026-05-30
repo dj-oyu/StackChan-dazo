@@ -552,6 +552,35 @@ bool StackChanCamera::Capture()
                     return false;
             }
 
+            // [TEMP DIAG] Fingerprint the captured frame to classify the "all green"
+            // instability: a UNIFORM buffer (min==max / varied~=0) means the frame was
+            // not really written (sensor/DMA/AE/memory-contention -> transient), while a
+            // VARIED buffer that still looks green points at the decode/preview path.
+            // px0 shows the actual pixel value (pure green RGB565 = 0x07e0). Also logs
+            // free memory to spot OOM/bandwidth pressure at capture time. Remove after
+            // the green-frame issue is diagnosed.
+            {
+                const uint16_t* diag_px = reinterpret_cast<const uint16_t*>(frame_.data);
+                size_t diag_count       = frame_.len / 2;
+                uint16_t diag_first     = diag_count ? diag_px[0] : 0;
+                uint16_t diag_min = 0xFFFF, diag_max = 0x0000;
+                uint32_t diag_varied = 0, diag_sampled = 0;
+                for (size_t i = 0; i < diag_count; i += 8) {
+                    uint16_t v = diag_px[i];
+                    if (v < diag_min) diag_min = v;
+                    if (v > diag_max) diag_max = v;
+                    if (v != diag_first) diag_varied++;
+                    diag_sampled++;
+                }
+                ESP_LOGI(TAG,
+                         "[DIAG] frame %dx%d fmt=0x%08lx len=%u px0=0x%04x min=0x%04x max=0x%04x varied=%lu/%lu "
+                         "free_psram=%u free_int=%u",
+                         (int)frame_.width, (int)frame_.height, (unsigned long)frame_.format, (unsigned)frame_.len,
+                         diag_first, diag_min, diag_max, (unsigned long)diag_varied, (unsigned long)diag_sampled,
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            }
+
 #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
 #ifndef CONFIG_SOC_PPA_SUPPORTED
             uint8_t* rotate_dst =
@@ -1071,6 +1100,18 @@ bool StackChanCamera::SetVFlip(bool enabled)
  */
 std::string StackChanCamera::Explain(const std::string& question)
 {
+    // If a host installed an explain delegate (e.g. the Grok realtime protocol's
+    // vision backend), let it describe the just-captured frame instead of POSTing
+    // to explain_url_. This keeps the capture/confirm flow here as the single
+    // source while the description is produced by whatever vision API the host uses.
+    if (explain_delegate_) {
+        std::string description;
+        if (explain_delegate_(question, description)) {
+            return description;
+        }
+        // Delegate failed; fall through to the built-in explain_url path below.
+    }
+
     if (explain_url_.empty()) {
         throw std::runtime_error("Image explain URL or token is not set");
     }

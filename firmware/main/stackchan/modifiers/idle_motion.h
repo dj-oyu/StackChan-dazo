@@ -19,7 +19,7 @@ namespace stackchan {
  */
 class IdleMotionModifier : public Modifier {
 public:
-    IdleMotionModifier(uint32_t interval_min = 4000, uint32_t interval_max = 8000)
+    IdleMotionModifier(uint32_t interval_min = 10000, uint32_t interval_max = 20000)
         : _interval_min(interval_min), _interval_max(interval_max)
     {
         _next_tick = GetHAL().millis() + 1000;  // 启动 1 秒后开始第一次动作

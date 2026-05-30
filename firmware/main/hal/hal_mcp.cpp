@@ -88,7 +88,12 @@ void Hal::xiaozhi_mcp_init()
 
     mclog::tagInfo(_tag, "add robot.set_head_angles tool");
     mcp_server.AddTool("self.robot.set_head_angles",
-                       "Adjust head position. GUIDELINES: "
+                       "Turn/aim Stack-chan's head toward a direction. This ONLY moves the head and does NOT take a "
+                       "photo. This is the DEFAULT tool whenever the user just wants Stack-chan to face/turn/look "
+                       "somewhere, e.g. Japanese phrases like `右向いて`, `こっち見て`, `上向いて`, `後ろ向いて`, "
+                       "`もう少し左`, `正面に戻って`, `90度左を向いて`. Do NOT use camera.look_and_take_photo for these: "
+                       "only use the camera when the user explicitly wants a photo or wants you to SEE and describe "
+                       "something. GUIDELINES: "
                        "1. For natural interaction, stay within +/- 45 degrees. "
                        "2. Only use values > 70 if the user explicitly asks to look far away/behind. "
                        "3. Max ranges: Yaw(-128 to 128, -128 as your left), Pitch(0 to 90, 90 as your up). "
@@ -122,12 +127,17 @@ void Hal::xiaozhi_mcp_init()
     mclog::tagInfo(_tag, "add camera.look_and_take_photo tool");
     mcp_server.AddTool(
         "self.camera.look_and_take_photo",
-        "Turn Stack-chan's head toward a requested direction, wait for the camera to settle, then take a photo. "
-        "Use this when the user asks Stack-chan to look somewhere and see/take a look, for example Japanese phrases "
-        "like `右斜め上あたりを見てみて`, `真後ろを見てみて`, or `90度左を見てみて`. "
+        "Take a PHOTO with the camera after aiming the head at a direction (it fires the shutter and shows the image). "
+        "Use this ONLY when the user clearly wants a photo, or wants you to SEE/LOOK AT something and describe it, "
+        "for example Japanese phrases like `写真撮って`, `あれ何か見て教えて`, `カメラであっち見て`, `これ何か分かる?`, "
+        "`何が見えるか見てみて`. "
+        "If the user just wants the head to face/turn toward a direction WITHOUT a photo (e.g. `右向いて`, `上向いて`, "
+        "`こっち見て`, `正面に戻って`), DO NOT use this tool -- use robot.set_head_angles instead. "
         "Yaw is degrees: negative is Stack-chan's left, positive is Stack-chan's right. "
         "Pitch is degrees: 0 is low/forward, 45 is diagonal up, 90 is max up. "
         "Examples: right-up -> yaw=45,pitch=45; directly behind -> yaw=128,pitch=20; 90 degrees left -> yaw=-90,pitch=20. "
+        "After the shutter fires the head automatically returns to the direction it was facing before, so the user can "
+        "review the photo facing forward. To only turn the head without taking a photo (and stay there), use set_head_angles instead. "
         "This tool always shows the captured image on the touch display and waits for the user's OK/NG confirmation before upload.",
         PropertyList({Property("yaw", kPropertyTypeInteger, 0, -128, 128),
                       Property("pitch", kPropertyTypeInteger, 20, 0, 90),
@@ -157,10 +167,18 @@ void Hal::xiaozhi_mcp_init()
             auto& motion = GetStackChan().motion();
             motion.setModifyLock(true);
             setServoPowerEnabled(true);
+            int original_yaw   = 0;
+            int original_pitch = 0;
+            bool head_turned   = false;
             try {
                 {
                     LvglLockGuard lock;
+                    // Remember where the head was pointing so we can return to it after
+                    // the shutter fires (getCurrentAngle() is in 0.1 deg units).
+                    original_yaw   = motion.yawServo().getCurrentAngle() / 10;
+                    original_pitch = motion.pitchServo().getCurrentAngle() / 10;
                     move_head_from_json(yaw, pitch, speed);
+                    head_turned = true;
                 }
 
                 wait_for_head_to_settle(settle_ms);
@@ -169,6 +187,39 @@ void Hal::xiaozhi_mcp_init()
                 if (!camera->Capture()) {
                     throw std::runtime_error("Failed to capture photo");
                 }
+
+                // The frame is now grabbed, so turn the head back to where it was
+                // pointing before and WAIT for it to physically settle *before* we
+                // put the photo on the screen. The stackchan update task only ticks
+                // the head animation while the avatar screen is shown (the photo
+                // preview takes over the display), so if we don't settle here the
+                // head would stay frozen mid-turn for the whole review. Settling now
+                // means the user always reviews the photo facing forward.
+                //
+                // IMPORTANT: disable auto-angle-sync for the return move. With it on,
+                // moveWithSpeed teleports the spring's start point to getCurrentAngle(),
+                // which is a *live serial read of the physical servo* (hal_servo.cpp).
+                // Right after the camera capture that read is unreliable (bus contention)
+                // and can come back near the home/target angle, which makes the spring
+                // think it has already arrived -> it never drives the servo back and the
+                // head stays frozen looking away. Animating from the spring's own
+                // internal angle (which is the photo pose we just settled at) is robust.
+                {
+                    LvglLockGuard lock;
+                    auto& m = GetStackChan().motion();
+                    int hw_yaw   = m.yawServo().getCurrentAngle();
+                    int hw_pitch = m.pitchServo().getCurrentAngle();
+                    mclog::tagInfo(_tag, "returning head to original: yaw={}, pitch={} (hw read now: yaw={}, pitch={})",
+                                   original_yaw, original_pitch, hw_yaw, hw_pitch);
+                    setServoPowerEnabled(true);
+                    m.setTorqueEnabled(true);
+                    m.setAutoAngleSyncEnabled(false);
+                    m.yawServo().moveWithSpeed(original_yaw * 10, speed);
+                    m.pitchServo().moveWithSpeed(original_pitch * 10, speed);
+                    m.setAutoAngleSyncEnabled(true);
+                }
+                wait_for_head_to_settle(0);
+                head_turned = false;
 
                 bool accepted = false;
                 SemaphoreHandle_t done = xSemaphoreCreateBinary();
@@ -191,6 +242,13 @@ void Hal::xiaozhi_mcp_init()
                 return result;
             } catch (...) {
                 display->SetPreviewImage(nullptr);
+                // If we failed (or the user rejected the photo) while the head was
+                // still turned away, bring it back so it doesn't get stuck looking
+                // off to the side.
+                if (head_turned) {
+                    LvglLockGuard lock;
+                    move_head_from_json(original_yaw, original_pitch, speed);
+                }
                 motion.setModifyLock(false);
                 throw;
             }

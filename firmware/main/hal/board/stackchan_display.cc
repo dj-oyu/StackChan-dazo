@@ -277,7 +277,8 @@ void StackChanAvatarDisplay::SetupUI()
     lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
-    CreateCameraButton();
+    // Camera button is NOT created here: it's created on conversation enter and
+    // destroyed in standby by SetStatus(), so it never shows during boot/activation.
 
     // GetHAL().startStackChanAutoUpdate(24);
 
@@ -349,7 +350,9 @@ void StackChanAvatarDisplay::RefreshCameraButton()
         return;
     }
 
-    if (camera_button_visible_ && image_confirm_panel_ == nullptr) {
+    // Hide the camera button during wake-word standby: it's only useful mid-conversation
+    // (the AI takes photos via its own tools), so it just clutters the idle face.
+    if (camera_button_visible_ && !hal_bridge::is_xiaozhi_idle() && image_confirm_panel_ == nullptr) {
         lv_obj_remove_flag(camera_button_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(camera_button_);
     } else {
@@ -378,14 +381,17 @@ void StackChanAvatarDisplay::CreateIdleMotionModifier()
             idle_motion_modifier_id_ = -1;
             return;
         case 1:
-            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(8000, 12000));
+            // calm
+            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(20000, 40000));
             return;
         case 3:
-            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(2000, 4000));
+            // lively
+            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(5000, 10000));
             return;
         case 2:
         default:
-            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>());
+            // moderate (was 4-8 s; raised to reduce servo-noise frequency / fidgetiness)
+            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(10000, 20000));
             return;
     }
 }
@@ -528,11 +534,15 @@ void StackChanAvatarDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image)
 void StackChanAvatarDisplay::SetCameraButtonVisible(bool visible)
 {
     DisplayLockGuard lock(this);
+    // Records whether the camera feature is available; the actual button is
+    // created/destroyed by SetStatus() on conversation enter/leave (see there).
     camera_button_visible_ = visible;
-    if (camera_button_ == nullptr && setup_ui_called_) {
-        CreateCameraButton();
+    if (!visible && camera_button_ != nullptr) {
+        lv_obj_del(camera_button_);
+        camera_button_ = nullptr;
+    } else {
+        RefreshCameraButton();
     }
-    RefreshCameraButton();
 }
 
 void StackChanAvatarDisplay::ShowImageConfirmation(std::function<void(bool accepted)> callback)
@@ -752,7 +762,19 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
         avatar.setSpeech("");
     }
 
-    RefreshCameraButton();
+    // Camera button lifecycle, driven by this state-transition event (runs once per
+    // transition, not per frame): create the LVGL button only for the duration of a
+    // conversation, and DESTROY it in standby so it frees its resources while idle.
+    if (is_idle || !camera_button_visible_) {
+        if (camera_button_ != nullptr) {
+            lv_obj_del(camera_button_);
+            camera_button_ = nullptr;
+        }
+    } else if (camera_button_ == nullptr && setup_ui_called_) {
+        CreateCameraButton();
+    } else {
+        RefreshCameraButton();
+    }
 }
 
 void StackChanAvatarDisplay::ShowNotification(const char* notification, int duration_ms)

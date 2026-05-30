@@ -409,6 +409,15 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
+    // [user request] Skip the startup OTA version check. The network round-trip to the
+    // version server added boot latency and, on failure, retried for minutes (blocking
+    // startup). We still mark the running partition valid so the bootloader's rollback
+    // mechanism keeps this firmware. Manual updates remain available via UpgradeFirmware
+    // / self.upgrade_firmware. (provider="gpt" is selected before any OTA-provided
+    // MQTT/WebSocket config, so skipping the check doesn't affect connecting.)
+    ota_->MarkCurrentVersionValid();
+    return;
+
     const int MAX_RETRY = 10;
     int retry_count = 0;
     int retry_delay = 10; // Initial retry delay in seconds
@@ -492,6 +501,7 @@ void Application::InitializeProtocol() {
 
     Settings agent_settings("agent", false);
     auto provider = agent_settings.GetString("provider", "xiaozhi");
+    cues_enabled_ = agent_settings.GetInt("cues", 1) != 0;  // turn-taking sound cues (default on)
     if (provider == "gpt") {
         ESP_LOGI(TAG, "Using GPT Realtime protocol");
         protocol_ = std::make_unique<GptRealtimeProtocol>();
@@ -946,6 +956,13 @@ void Application::HandleStateChangedEvent() {
                 play_popup_on_listening_ = false;
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             }
+            // Walkie-talkie "squelch tail" cue when the assistant just finished its turn
+            // (speaking -> listening = "your turn"). Placed here, after EnableVoiceProcessing's
+            // ResetDecoder and alongside the proven-safe OGG_POPUP, so it isn't cleared and
+            // AEC cancels it from the freshly-enabled mic.
+            if (cues_enabled_ && previous_state_ == kDeviceStateSpeaking) {
+                audio_service_.PlayCue(AudioService::Cue::kTurnEnd);
+            }
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -972,6 +989,8 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+
+    previous_state_ = new_state;
 }
 
 void Application::Schedule(std::function<void()>&& callback) {

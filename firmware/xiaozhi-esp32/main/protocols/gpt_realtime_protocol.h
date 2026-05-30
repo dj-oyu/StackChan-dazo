@@ -132,9 +132,6 @@ private:
     void HandleTranscriptDelta(const cJSON* root);
     void EmitTtsState(const char* state, const char* text = nullptr);
     bool SendUserTextItem(const std::string& text, bool create_response);
-    bool ExecuteStackChanCameraTool(const char* name, const cJSON* args, std::string& output);
-    bool CaptureImageForFunctionTool(bool move_head, int yaw, int pitch, int speed, int settle_ms,
-                                     const std::string& question, std::string& output);
     bool DescribeImageWithGrok(const std::string& data_uri, std::string& description);
     std::string ExtractTextFromJson(const cJSON* root) const;
     void StartOutputAudioTask();
