@@ -95,6 +95,7 @@ GptRealtimeProtocol::GptRealtimeProtocol(RealtimeProvider provider)
 
 GptRealtimeProtocol::~GptRealtimeProtocol()
 {
+    UnregisterCameraExplainDelegate();
     CloseAudioChannel(false);
     StopOutputAudioTask();
     if (input_opus_decoder_ != nullptr) {
@@ -199,38 +200,7 @@ bool GptRealtimeProtocol::OpenAudioChannel()
         return false;
     }
 
-    // Route the camera's "describe the captured frame" step through this protocol's
-    // vision path. The MCP camera tools own the capture/confirm flow and call
-    // camera->Explain(); this delegate produces the visual result the right way for
-    // the active provider instead of POSTing to the (unused) explain_url. Registered
-    // here so it's set before any tool call and refreshed each session.
-    if (auto* camera = Board::GetInstance().GetCamera()) {
-        camera->SetExplainDelegate([this, camera](const std::string& question, std::string& description) -> bool {
-            std::string data_uri;
-            if (!camera->EncodeToJpegDataUri(data_uri, 80)) {
-                return false;
-            }
-            if (provider_ == RealtimeProvider::OpenAi) {
-                // OpenAI realtime can see images directly, so attach the photo to the
-                // conversation and let the model answer from it. The function result
-                // is just a confirmation note.
-                std::string note =
-                    "The user approved this camera photo for the current request. Use it as visual context to "
-                    "answer: " + question;
-                if (!SendImageMessage(data_uri, note)) {
-                    return false;
-                }
-                description = "The approved camera photo was attached to the conversation as visual context.";
-                return true;
-            }
-            // Grok's voice endpoint can't take images: describe via the separate xAI
-            // vision API and feed the text back. This call takes a few seconds.
-            if (auto* display = Board::GetInstance().GetDisplay()) {
-                display->SetChatMessage("system", "画像を確認しています…");
-            }
-            return DescribeImageWithGrok(data_uri, description);
-        });
-    }
+    RegisterCameraExplainDelegate();
 
     error_occurred_ = false;
     audio_channel_opened_ = false;
@@ -316,6 +286,7 @@ bool GptRealtimeProtocol::OpenAudioChannel()
 void GptRealtimeProtocol::CloseAudioChannel(bool send_goodbye)
 {
     (void)send_goodbye;
+    UnregisterCameraExplainDelegate();
     audio_channel_opened_ = false;
     // Move the socket out under the lock and destroy it after releasing it, so a
     // concurrent SendText/IsAudioChannelOpened can't use a half-destroyed socket
@@ -326,6 +297,52 @@ void GptRealtimeProtocol::CloseAudioChannel(bool send_goodbye)
         ws = std::move(websocket_);
     }
     ws.reset();
+}
+
+void GptRealtimeProtocol::RegisterCameraExplainDelegate()
+{
+    auto* camera = Board::GetInstance().GetCamera();
+    if (camera == nullptr) {
+        camera_explain_delegate_registered_ = false;
+        return;
+    }
+
+    // Route the camera's "describe the captured frame" step through this protocol's
+    // vision path. The MCP camera tools own the capture/confirm flow and call
+    // camera->Explain(); this delegate is cleared when this channel/protocol ends.
+    camera->SetExplainDelegate([this, camera](const std::string& question, std::string& description) -> bool {
+        std::string data_uri;
+        if (!camera->EncodeToJpegDataUri(data_uri, 80)) {
+            return false;
+        }
+        if (provider_ == RealtimeProvider::OpenAi) {
+            std::string note =
+                "The user approved this camera photo for the current request. Use it as visual context to answer: " +
+                question;
+            if (!SendImageMessage(data_uri, note)) {
+                return false;
+            }
+            description = "The approved camera photo was attached to the conversation as visual context.";
+            return true;
+        }
+
+        if (auto* display = Board::GetInstance().GetDisplay()) {
+            display->SetChatMessage("system", "画像を確認しています…");
+        }
+        return DescribeImageWithGrok(data_uri, description);
+    });
+    camera_explain_delegate_registered_ = true;
+}
+
+void GptRealtimeProtocol::UnregisterCameraExplainDelegate()
+{
+    if (!camera_explain_delegate_registered_) {
+        return;
+    }
+    if (auto* camera = Board::GetInstance().GetCamera()) {
+        camera->ClearExplainDelegate();
+    }
+    camera_explain_delegate_registered_ = false;
 }
 
 bool GptRealtimeProtocol::IsAudioChannelOpened() const

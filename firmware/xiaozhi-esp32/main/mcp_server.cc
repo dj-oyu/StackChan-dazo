@@ -542,26 +542,7 @@ std::string McpServer::CallToolSync(const std::string& tool_name, const cJSON* a
         throw std::runtime_error("Unknown tool: " + tool_name);
     }
 
-    PropertyList parsed = (*tool_iter)->properties();
-    for (auto& argument : parsed) {
-        bool found = false;
-        if (cJSON_IsObject(arguments)) {
-            auto value = cJSON_GetObjectItem(arguments, argument.name().c_str());
-            if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
-                argument.set_value<bool>(value->valueint == 1);
-                found = true;
-            } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
-                argument.set_value<int>(value->valueint);
-                found = true;
-            } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
-                argument.set_value<std::string>(value->valuestring);
-                found = true;
-            }
-        }
-        if (!argument.has_default_value() && !found) {
-            throw std::runtime_error("Missing valid argument: " + argument.name());
-        }
-    }
+    PropertyList parsed = ParseToolArguments(*tool_iter, arguments);
 
     // Call() returns the MCP result wrapper {"content":[{"type":"text","text":...}],...}.
     // Unwrap the first text content so callers get the tool's plain result.
@@ -582,6 +563,30 @@ std::string McpServer::CallToolSync(const std::string& tool_name, const cJSON* a
     return text;
 }
 
+PropertyList McpServer::ParseToolArguments(const McpTool* tool, const cJSON* tool_arguments) const {
+    PropertyList parsed = tool->properties();
+    for (auto& argument : parsed) {
+        bool found = false;
+        if (cJSON_IsObject(tool_arguments)) {
+            auto value = cJSON_GetObjectItem(tool_arguments, argument.name().c_str());
+            if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
+                argument.set_value<bool>(value->valueint == 1);
+                found = true;
+            } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
+                argument.set_value<int>(value->valueint);
+                found = true;
+            } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
+                argument.set_value<std::string>(value->valuestring);
+                found = true;
+            }
+        }
+        if (!argument.has_default_value() && !found) {
+            throw std::runtime_error("Missing valid argument: " + argument.name());
+        }
+    }
+    return parsed;
+}
+
 void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments) {
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 
@@ -594,30 +599,9 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
         return;
     }
 
-    PropertyList arguments = (*tool_iter)->properties();
+    PropertyList arguments;
     try {
-        for (auto& argument : arguments) {
-            bool found = false;
-            if (cJSON_IsObject(tool_arguments)) {
-                auto value = cJSON_GetObjectItem(tool_arguments, argument.name().c_str());
-                if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
-                    argument.set_value<bool>(value->valueint == 1);
-                    found = true;
-                } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
-                    argument.set_value<int>(value->valueint);
-                    found = true;
-                } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
-                    argument.set_value<std::string>(value->valuestring);
-                    found = true;
-                }
-            }
-
-            if (!argument.has_default_value() && !found) {
-                ESP_LOGE(TAG, "tools/call: Missing valid argument: %s", argument.name().c_str());
-                ReplyError(id, "Missing valid argument: " + argument.name());
-                return;
-            }
-        }
+        arguments = ParseToolArguments(*tool_iter, tool_arguments);
     } catch (const std::exception& e) {
         ESP_LOGE(TAG, "tools/call: %s", e.what());
         ReplyError(id, e.what());

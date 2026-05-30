@@ -165,9 +165,107 @@ void Hal::xiaozhi_board_init()
     hal_bridge::xiaozhi_board_init();
 }
 
+class BeatReactiveAnimator {
+public:
+    void update(const hal_bridge::BeatState& beat)
+    {
+        update_neon(beat);
+        update_avatar(beat);
+    }
+
+private:
+    void update_neon(const hal_bridge::BeatState& beat)
+    {
+        if (beat.locked && beat.period_us > 0) {
+            int64_t k = (esp_timer_get_time() - beat.anchor_us) / beat.period_us;
+            if (k != beat_k_) {
+                beat_k_ = k;
+                beat_intensity_ = 1.0f;
+
+                float bpm = 60000000.0f / (float)beat.period_us;
+                float t = (bpm - 60.0f) / 120.0f;
+                if (t < 0) t = 0;
+                if (t > 1) t = 1;
+                float hue = (1.0f - t) * 240.0f;
+
+                int lvl = (int)(beat.confidence * 4.0f);
+                if (lvl < 0) lvl = 0;
+                if (lvl > 3) lvl = 3;
+                float peak = (60.0f + lvl * (40.0f / 3.0f)) / 255.0f;
+                hsv_to_rgb(hue, 1.0f, peak, &beat_r_, &beat_g_, &beat_b_);
+            }
+        } else {
+            beat_k_ = -1;
+        }
+
+        if (beat_intensity_ <= 0.02f) {
+            return;
+        }
+        uint8_t r = (uint8_t)(beat_r_ * beat_intensity_);
+        uint8_t g = (uint8_t)(beat_g_ * beat_intensity_);
+        uint8_t b = (uint8_t)(beat_b_ * beat_intensity_);
+        for (int i = 0; i < 12; ++i) {
+            GetHAL().setRgbColor(i, r, g, b);
+        }
+        GetHAL().refreshRgb();
+        beat_intensity_ *= 0.78f;
+    }
+
+    void update_avatar(const hal_bridge::BeatState& beat)
+    {
+        using Emotion = stackchan::avatar::Emotion;
+        if (beat.locked && beat.period_us > 0 && GetStackChan().hasAvatar()) {
+            auto& avatar = GetStackChan().avatar();
+            int64_t k = (esp_timer_get_time() - beat.anchor_us) / beat.period_us;
+            if (k != headbang_k_) {
+                headbang_k_ = k;
+                headbang_ = 1.0f;
+                if ((esp_random() % 100) < 15) {
+                    uint32_t e = esp_random() % 100;
+                    Emotion em = (e < 55) ? Emotion::Happy
+                               : (e < 85) ? Emotion::Neutral
+                                          : Emotion::Doubt;
+                    avatar.setEmotion(em);
+                }
+            }
+
+            int dy = (int)(headbang_ * 38.0f);
+            avatar.leftEye().setPosition(uitk::Vector2i(0, dy));
+            avatar.rightEye().setPosition(uitk::Vector2i(0, dy));
+            avatar.mouth().setPosition(uitk::Vector2i(0, dy));
+            headbang_ *= 0.82f;
+            headbang_active_ = true;
+            return;
+        }
+
+        if (!headbang_active_) {
+            return;
+        }
+        headbang_active_ = false;
+        headbang_k_ = -1;
+        if (GetStackChan().hasAvatar()) {
+            auto& avatar = GetStackChan().avatar();
+            avatar.leftEye().setPosition(uitk::Vector2i(0, 0));
+            avatar.rightEye().setPosition(uitk::Vector2i(0, 0));
+            avatar.mouth().setPosition(uitk::Vector2i(0, 0));
+            avatar.setEmotion(Emotion::Neutral);
+        }
+    }
+
+    int64_t beat_k_ = -1;
+    float beat_intensity_ = 0.0f;
+    uint8_t beat_r_ = 0;
+    uint8_t beat_g_ = 0;
+    uint8_t beat_b_ = 0;
+    int64_t headbang_k_ = -1;
+    float headbang_ = 0.0f;
+    bool headbang_active_ = false;
+};
+
 static void _stackchan_update_task(void* param)
 {
     bool is_setup_done = false;
+    BeatReactiveAnimator beat_animator;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -182,91 +280,7 @@ static void _stackchan_update_task(void* param)
 
         GetStackChan().update();
 
-        // Beat-reactive neon pulse: when the audio task has locked a tempo (music in
-        // idle), derive the beat phase from the shared anchor/period and flash the neon
-        // LEDs on each beat. This task owns the LEDs, so driving them here avoids
-        // contention. Inactive (and harmless) whenever no tempo is locked.
-        {
-            static int64_t s_beat_k = -1;
-            static float s_beat_intensity = 0.0f;
-            static uint8_t s_beat_r = 0, s_beat_g = 0, s_beat_b = 0;
-            auto beat = hal_bridge::beat_get();
-            if (beat.locked && beat.period_us > 0) {
-                int64_t k = (esp_timer_get_time() - beat.anchor_us) / beat.period_us;
-                if (k != s_beat_k) {
-                    s_beat_k = k;
-                    s_beat_intensity = 1.0f;  // fresh beat
-                    // Hue from tempo: slow (60 bpm) -> blue, fast (180 bpm) -> red.
-                    float bpm = 60000000.0f / (float)beat.period_us;
-                    float t = (bpm - 60.0f) / 120.0f;
-                    if (t < 0) t = 0;
-                    if (t > 1) t = 1;
-                    float hue = (1.0f - t) * 240.0f;
-                    // Peak brightness by confidence, quantized to 4 steps over 60..100
-                    // (60 / 73 / 87 / 100): wrong/uncertain beats look dim, sure ones pop.
-                    int lvl = (int)(beat.confidence * 4.0f);
-                    if (lvl < 0) lvl = 0;
-                    if (lvl > 3) lvl = 3;
-                    float peak = (60.0f + lvl * (40.0f / 3.0f)) / 255.0f;
-                    hsv_to_rgb(hue, 1.0f, peak, &s_beat_r, &s_beat_g, &s_beat_b);
-                }
-            } else {
-                s_beat_k = -1;
-            }
-            if (s_beat_intensity > 0.02f) {
-                uint8_t r = (uint8_t)(s_beat_r * s_beat_intensity);
-                uint8_t g = (uint8_t)(s_beat_g * s_beat_intensity);
-                uint8_t b = (uint8_t)(s_beat_b * s_beat_intensity);
-                for (int i = 0; i < 12; ++i) {
-                    GetHAL().setRgbColor(i, r, g, b);  // tempo-coloured pulse, decays each tick
-                }
-                GetHAL().refreshRgb();
-                s_beat_intensity *= 0.78f;
-            }
-        }
-
-        // Beat-reactive "headbang": dip the face parts down on each beat then ease back
-        // up (nodding to the music). On some beats, switch the "grooving" expression at
-        // random (incl. neutral) for variety.
-        {
-            static int64_t s_hb_k = -1;
-            static float s_hb = 0.0f;
-            static bool s_hb_active = false;
-            using Emotion = stackchan::avatar::Emotion;
-            auto beat = hal_bridge::beat_get();
-            if (beat.locked && beat.period_us > 0 && GetStackChan().hasAvatar()) {
-                auto& avatar = GetStackChan().avatar();
-                int64_t k = (esp_timer_get_time() - beat.anchor_us) / beat.period_us;
-                if (k != s_hb_k) {
-                    s_hb_k = k;
-                    s_hb = 1.0f;  // fresh beat -> full dip
-                    // ~15% of beats: pick a new expression (weighted, neutral included).
-                    if ((esp_random() % 100) < 15) {
-                        uint32_t e = esp_random() % 100;
-                        Emotion em = (e < 55) ? Emotion::Happy
-                                   : (e < 85) ? Emotion::Neutral
-                                              : Emotion::Doubt;
-                        avatar.setEmotion(em);
-                    }
-                }
-                int dy = (int)(s_hb * 38.0f);  // dip down on the beat (no tilt)
-                avatar.leftEye().setPosition(uitk::Vector2i(0, dy));
-                avatar.rightEye().setPosition(uitk::Vector2i(0, dy));
-                avatar.mouth().setPosition(uitk::Vector2i(0, dy));
-                s_hb *= 0.82f;
-                s_hb_active = true;
-            } else if (s_hb_active) {
-                s_hb_active = false;
-                s_hb_k = -1;
-                if (GetStackChan().hasAvatar()) {
-                    auto& avatar = GetStackChan().avatar();
-                    avatar.leftEye().setPosition(uitk::Vector2i(0, 0));
-                    avatar.rightEye().setPosition(uitk::Vector2i(0, 0));
-                    avatar.mouth().setPosition(uitk::Vector2i(0, 0));
-                    avatar.setEmotion(Emotion::Neutral);
-                }
-            }
-        }
+        beat_animator.update(hal_bridge::beat_get());
 
         if (!hal_bridge::is_xiaozhi_ready()) {
             continue;

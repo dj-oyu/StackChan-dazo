@@ -114,6 +114,7 @@ private:
     // mic level reaching Grok is low, so its VAD ignores normal speech; amplify
     // it. 1 = unchanged (OpenAI path).
     int mic_gain_ = 1;
+    bool camera_explain_delegate_registered_ = false;
 
     const char* ProviderName() const;
 
@@ -122,6 +123,8 @@ private:
     bool SendSessionUpdate();
     bool SendGrokSessionUpdate();
     void AddStackChanFunctionTools(cJSON* session);
+    void RegisterCameraExplainDelegate();
+    void UnregisterCameraExplainDelegate();
     void HandleTextMessage(const char* data, size_t len);
     void RememberFunctionCallName(const cJSON* root);
     void HandleFunctionCall(const cJSON* root);

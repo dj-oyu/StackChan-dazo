@@ -15,6 +15,7 @@ public:
     // on success; false to fall back to the built-in path.
     using ExplainDelegate = std::function<bool(const std::string& question, std::string& description)>;
     void SetExplainDelegate(ExplainDelegate delegate) { explain_delegate_ = std::move(delegate); }
+    void ClearExplainDelegate() { explain_delegate_ = nullptr; }
 
     virtual void SetExplainUrl(const std::string& url, const std::string& token) = 0;
     virtual bool Capture() = 0;

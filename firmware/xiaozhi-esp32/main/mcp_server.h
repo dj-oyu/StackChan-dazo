@@ -351,6 +351,7 @@ private:
 
     void GetToolsList(int id, const std::string& cursor, bool list_user_only_tools);
     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
+    PropertyList ParseToolArguments(const McpTool* tool, const cJSON* tool_arguments) const;
 
     std::vector<McpTool*> tools_;
 };
