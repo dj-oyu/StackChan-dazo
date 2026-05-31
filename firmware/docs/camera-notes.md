@@ -5,47 +5,62 @@ Hardware: M5Stack CoreS3, GC0308 VGA DVP sensor, ESP-IDF v6 `esp_video` (V4L2) +
 `main/hal/board/stackchan_display.cc`,
 `xiaozhi-esp32/main/protocols/gpt_realtime_protocol.cc`.
 
-## Preview color: the buffer is RGB565, not YUV422 (root cause of the magenta/green cast)
+## Pixel format: the buffer is big-endian RGB565 — do NOT trust the FourCC
 
-The captured frame is reported as `V4L2_PIX_FMT_YUYV` (0x56595559) /
-sensor format `0x50323234` ("422P"), **but the bytes are actually big-endian
-RGB565**. Decoding them as YUYV is what produced the long-standing
-magenta/green preview.
+The sensor's reported format is a lie on this module. Three sources disagree:
+the V4L2 query reports `0x50323234` ("422P"), the raw `dump_raw_frame` buffer
+reports the same, yet **the actual bytes only decode correctly as big-endian
+RGB565** (verified by dumping a frame and rendering all six candidate
+interpretations — only `rgb565_be` produced a real photo; every YUV ordering was
+garbage). Treating the bytes as YUYV was the long-standing cause of the
+magenta/green cast (Grok literally described a "green-purple marble").
 
-Fix (in the `V4L2_PIX_FMT_YUYV` case of `StackChanCamera::Capture()`): reinterpret
-each pixel as RGB565 big-endian:
+Counter-intuitively, the sensor's nominal **"RGB565" mode (reg `0x24`=`0xa6`,
+GC0308 Kconfig index 5) produces corrupt frames** (green / green-magenta speckle),
+while its **"YUV422" mode (reg `0x24`=`0xa2`, index 3) streams clean RGB565-BE**.
+Register writes do take effect (geometry/subsample come out correct, so SCCB
+works) — this module's `0x24` format encoding simply does not match the stock
+GC0308 driver's model. So: **keep Kconfig on index 3 (YUV422) for clean data.**
 
-```c
-uint16_t v = (src[2*i] << 8) | src[2*i + 1];   // R5 G6 B5
+`StackChanCamera::Capture()` then relabels it. In the copy `switch`, the
+`V4L2_PIX_FMT_YUV422P` case is handled **exactly like `RGB565X`**: byte-swap each
+pixel `BE -> LE` and set `frame_.format = V4L2_PIX_FMT_RGB565`. After that one
+relabel, every downstream path is correct and consistent (preview/rotate use
+`RGB565_LE`, JPEG/vision encode RGB565), with no per-path reinterpretation.
+
+## Intermittent green frames: lightweight validate-and-retry
+
+This sensor intermittently emits corrupt frames (all-green, or a green-magenta
+speckle). `Capture()` validates each frame (after the RGB565 relabel) and retries
+on failure — up to 12 validated attempts (`kMaxCaptureAttempts = kWarmupFrames +
+12`), ~80–130 ms each. Only a validated frame reaches the user / vision backend.
+
+The detector (`analyze_rgb565_frame` + `looks_like_bad_green_frame`) is built to
+be cheap. Corruption decorrelates the green channel from luma while R and B keep
+the scene, so the verdict is the **sign of `cov(R,G)`**:
+
+```
+C = n*Σ(r*g) − Σr*Σg     // ∝ cov(R,G); clean ⇒ C>0, green-corrupt ⇒ C<0
+bad = (C < 0) || (Σg*2 > 3*(Σr+Σb))   // OR extreme green-dominance (all-green has C≈0)
 ```
 
-Verified on device with uniform color cards:
-
-| Subject | raw bytes | as RGB565-BE | result  |
-|---------|-----------|--------------|---------|
-| red     | `c1 a5`   | `0xc1a5`     | R=24 G=13 B=5  (red)   |
-| green   | `16 a2`   | `0x16a2`     | R=2  G=53 B=2  (green) |
-
-### The JPEG sent to the vision model needs the SAME fix
-
-The preview path (above) was fixed first, but the JPEG encode path
-(`EncodeToJpegDataUri` and the `Explain` encoder thread) still passed
-`frame_.format` (== `V4L2_PIX_FMT_YUYV`) to `image_to_jpeg_cb`, so the photo
-sent to Grok was decoded as YUV → a magenta/green image (Grok literally
-described a "purple face, green outline"). Fix: pass **`V4L2_PIX_FMT_RGB565X`**
-(big-endian RGB565, supported by the encoder's `esp_imgfx` path) when the frame
-is YUYV-labelled. After this Grok describes correct colors. NOTE: GC0308 still
-has a mild green/white-balance bias (the red card decodes to G=13); it's minor
-and left uncorrected per the user's "no software correction" preference.
+This is scale-invariant (no divide / sqrt / variance). Sampling is **5 contiguous
+rows spread vertically**: row-contiguous keeps memory access sequential, while
+spreading the rows catches partially-updated/torn frames that a head-only block
+misses. The inner loop is branch-free (pure accumulation); all comparisons happen
+once at the end. It reads `frame_.data` little-endian (post byte-swap).
 
 ### Dead ends (do NOT repeat)
 
-All of these were tried and are **wrong** — the data was never YUV:
-Cb/Cr swap, chroma inversion (hue 180°), `average chroma` reg `0x24` `0x82` vs
-`0xa2`, planar 422P layout, the YUV color matrix / AWB gains. A full-screen
-R/G/B/white **test pattern displayed correctly**, which proved the LVGL/panel
-color path is fine and the bug was 100% in interpreting the source bytes.
-GC0308 reg `0x24` is left at the factory value `0xa2`.
+- The data is **not** YUV. Cb/Cr swap, hue 180°, planar 422P, YUV matrix/AWB —
+  all tried, all wrong. A full-screen R/G/B/white test pattern displayed
+  correctly, proving the LVGL/panel path is fine; the bug was 100% in
+  interpreting the source bytes.
+- Do **not** switch Kconfig to the GC0308 "RGB565" mode (index 5 / reg `0xa6`)
+  expecting cleaner data — on this module that mode is the one that corrupts.
+- Do **not** count "green pixels" to detect bad frames: a genuinely green subject
+  keeps R/G/B correlated (`cov(R,G) > 0`) and must not be rejected; corruption is
+  what makes `cov(R,G)` go negative.
 
 ## Resolution: use 320×240, not 640×480
 
@@ -105,8 +120,10 @@ Key requirements (see `gpt_realtime_protocol.cc`):
   60 s timeout.
 - Use **`esp_http_client`** (cert bundle) for the POST, not the board's custom
   `HttpClient` (its TLS receive task is starved during realtime audio).
-- Encode the JPEG as **`V4L2_PIX_FMT_RGB565X`**, not the buffer's `YUYV` label
-  (see the JPEG color section above), or Grok sees a magenta/green image.
+- Encode the JPEG using `frame_.format` directly. After the capture relabel that
+  is `V4L2_PIX_FMT_RGB565` (see the pixel-format section), so the vision JPEG is
+  RGB565 — verified on device: Grok now reports real colors (e.g. "black bar with
+  white and yellow characters") instead of the old magenta/green misread.
 
 ### Grok will NOT auto-speak the photo result — by design
 

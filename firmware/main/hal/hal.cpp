@@ -263,7 +263,7 @@ private:
             avatar.leftEye().setPosition(uitk::Vector2i(0, 0));
             avatar.rightEye().setPosition(uitk::Vector2i(0, 0));
             avatar.mouth().setPosition(uitk::Vector2i(0, 0));
-            avatar.setEmotion(Emotion::Neutral);
+            avatar.setEmotion(stackchan::avatar::Emotion::Neutral);
         }
     }
 

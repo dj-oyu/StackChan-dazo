@@ -55,6 +55,9 @@ CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 CONFIG_MBEDTLS_SSL_RENEGOTIATION=n
 CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
 CONFIG_CAMERA_GC0308=y
+# This GC0308 module's "RGB565" mode (reg 0x24=0xa6) produces corrupt frames; its "YUV422"
+# mode (0xa2) actually streams clean big-endian RGB565. So select YUV422 here for clean data,
+# and stackchan_camera.cc relabels the YUV422P buffer as RGB565 (RGB565X byte-swap).
 CONFIG_CAMERA_GC0308_DVP_YUV422_320X240_20FPS=y
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y

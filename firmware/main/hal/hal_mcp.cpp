@@ -10,6 +10,8 @@
 #include <apps/common/common.h>
 #include <application.h>
 #include <board.h>
+#include <hal/board/hal_bridge.h>
+#include <hal/board/stackchan_camera.h>
 #include <lvgl_display.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -252,6 +254,23 @@ void Hal::xiaozhi_mcp_init()
                 motion.setModifyLock(false);
                 throw;
             }
+        });
+
+    mclog::tagInfo(_tag, "add camera.dump_raw_frame tool");
+    mcp_server.AddTool(
+        "self.camera.dump_raw_frame",
+        "Debug-only tool. Capture one raw camera sensor buffer and print it to the serial log as CAMRAW Base64 chunks. "
+        "Use this when diagnosing camera pixel format, byte order, or corrupted green frames. It does not JPEG-encode, "
+        "rotate, or color-convert the image.",
+        std::vector<Property>{}, [this](const PropertyList& properties) -> ReturnValue {
+            auto camera = hal_bridge::board_get_camera();
+            if (camera == nullptr) {
+                throw std::runtime_error("Camera is unavailable");
+            }
+            if (!camera->DumpRawCaptureToLog()) {
+                throw std::runtime_error("Failed to dump raw camera frame");
+            }
+            return "Raw camera frame dumped to serial log. Capture it with firmware/tools/camraw.py (receive/extract).";
         });
 
     mclog::tagInfo(_tag, "add robot.set_led_color tool");

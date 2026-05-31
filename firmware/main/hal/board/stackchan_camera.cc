@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
 #include <cstdio>
 #include <cstring>
 #include <mbedtls/base64.h>
@@ -197,7 +198,8 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
     uint32_t best_fmt           = 0;
     int best_rank               = 1 << 30;  // large number
 
-    // 注: 当前版本 esp_video 中 YUV422P 实际输出为 YUYV。
+    // Current esp_video reports this GC0308 path as YUV422P, but the delivered
+    // packed stream is YUYV. Normalize that once at ingest, then trust frame_.format.
 #if defined(CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE) && defined(CONFIG_SOC_PPA_SUPPORTED)
     auto get_rank = [](uint32_t fmt) -> int {
         switch (fmt) {
@@ -205,9 +207,11 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
                 return 0;
             case V4L2_PIX_FMT_RGB565:
                 return 1;
+            case V4L2_PIX_FMT_YUYV:
+                return 2;
 #ifdef CONFIG_XIAOZHI_ENABLE_HARDWARE_JPEG_ENCODER
             case V4L2_PIX_FMT_YUV420:  // 软件 JPEG 编码器不支持 YUV420 格式
-                return 2;
+                return 3;
 #endif  // CONFIG_XIAOZHI_ENABLE_HARDWARE_JPEG_ENCODER
             case V4L2_PIX_FMT_GREY:
             case V4L2_PIX_FMT_YUV422P:
@@ -219,9 +223,11 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
     auto get_rank = [](uint32_t fmt) -> int {
         switch (fmt) {
             case V4L2_PIX_FMT_RGB565:
-                return 9;  // prefer RGB565: this GC0308/esp_video path delivers clean RGB565
-            case V4L2_PIX_FMT_YUV422P:
+                return 9;
+            case V4L2_PIX_FMT_YUYV:
                 return 10;
+            case V4L2_PIX_FMT_YUV422P:
+                return 11;
             case V4L2_PIX_FMT_RGB24:
                 return 12;
 #ifdef CONFIG_XIAOZHI_ENABLE_HARDWARE_JPEG_ENCODER
@@ -393,6 +399,216 @@ void StackChanCamera::SetExplainUrl(const std::string& url, const std::string& t
     explain_token_ = token;
 }
 
+static v4l2_pix_fmt_t jpeg_encode_format_for(v4l2_pix_fmt_t frame_format)
+{
+    // Keep the encoder input consistent with the frame FourCC. Do not reinterpret
+    // YUV buffers as RGB; image_to_jpeg_cb supports YUYV/YUV422P directly.
+    return frame_format;
+}
+
+static bool log_base64_camera_raw(const uint8_t* data, size_t len, uint16_t width, uint16_t height,
+                                  v4l2_pix_fmt_t format, size_t chunk_size)
+{
+    if (data == nullptr || len == 0) {
+        ESP_LOGE(TAG, "raw dump has no data");
+        return false;
+    }
+
+    constexpr size_t kMaxRawChunk = 768;
+    if (chunk_size == 0 || chunk_size > kMaxRawChunk) {
+        chunk_size = kMaxRawChunk;
+    }
+    chunk_size -= chunk_size % 3;
+    if (chunk_size == 0) {
+        chunk_size = 3;
+    }
+
+    uint8_t encoded[((kMaxRawChunk + 2) / 3) * 4 + 1];
+    const size_t chunks = (len + chunk_size - 1) / chunk_size;
+    printf("CAMRAW:BEGIN width=%u height=%u format=0x%08lx len=%u chunk=%u chunks=%u\n", width, height,
+           (unsigned long)format, (unsigned)len, (unsigned)chunk_size, (unsigned)chunks);
+
+    for (size_t offset = 0, index = 0; offset < len; offset += chunk_size, index++) {
+        const size_t raw_len = MIN(chunk_size, len - offset);
+        size_t out_len       = 0;
+        // dlen must include room for mbedtls' terminating NUL; encoded[] is sized for base64+NUL,
+        // so pass the full size. Passing sizeof-1 made a full 768B chunk fail with -138
+        // (PSA_ERROR_BUFFER_TOO_SMALL), aborting the dump at index 0.
+        int ret = mbedtls_base64_encode(encoded, sizeof(encoded), &out_len, data + offset, raw_len);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "base64 encode failed: %d", ret);
+            printf("CAMRAW:ABORT index=%u err=%d\n", (unsigned)index, ret);
+            return false;
+        }
+        encoded[out_len] = '\0';
+        printf("CAMRAW:DATA index=%u offset=%u raw=%u b64=%s\n", (unsigned)index, (unsigned)offset,
+               (unsigned)raw_len, encoded);
+        if ((index % 16) == 15) {
+            fflush(stdout);
+            // This runs on the CPU0-pinned `main` task and streams ~200 chunks over serial
+            // (~18s). The Task WDT here watches IDLE0, which is lower priority than main, so it
+            // only runs when main actually blocks. pdMS_TO_TICKS(1) is 0 ticks at a 100Hz tick,
+            // making vTaskDelay a bare yield that never lets IDLE0 run -> WDT fired and its log
+            // message spliced into a b64 line, corrupting a chunk. Block at least one full tick
+            // so IDLE0 gets scheduled and feeds its watchdog. Also feed our own WDT if subscribed.
+            if (esp_task_wdt_status(nullptr) == ESP_OK) {
+                esp_task_wdt_reset();
+            }
+            vTaskDelay(MAX(pdMS_TO_TICKS(10), 1));
+        }
+    }
+
+    printf("CAMRAW:END len=%u\n", (unsigned)len);
+    fflush(stdout);
+    return true;
+}
+
+struct CameraFrameQuality {
+    uint16_t first = 0;
+    uint16_t min = 0xFFFF;
+    uint16_t max = 0;
+    uint32_t varied = 0;
+    uint32_t sampled = 0;
+    uint32_t green_dominant = 0;
+    bool yuv = false;
+    // RGB565 lightweight green/corruption detector accumulators (raw 5/6-bit channel sums).
+    // Filled branch-free; the verdict (sign of cov(R,G) + green dominance) is applied once later.
+    uint32_t n = 0;
+    int64_t sum_r = 0, sum_g = 0, sum_b = 0, sum_rg = 0;
+};
+
+static uint8_t clamp_u8(int value)
+{
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return static_cast<uint8_t>(value);
+}
+
+static bool yuv_pixel_is_green(uint8_t y, uint8_t u, uint8_t v)
+{
+    int c = static_cast<int>(y) - 16;
+    int d = static_cast<int>(u) - 128;
+    int e = static_cast<int>(v) - 128;
+    uint8_t r = clamp_u8((298 * c + 409 * e + 128) >> 8);
+    uint8_t g = clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8);
+    uint8_t b = clamp_u8((298 * c + 516 * d + 128) >> 8);
+    return g > 160 && g > r + 40 && g > b + 40;
+}
+
+// Sample a few contiguous rows spread vertically. Reading each row contiguously keeps
+// memory access sequential (prefetch-friendly); spreading the rows avoids the blind spot
+// where a partially-updated frame is intact at the top but corrupt below (observed on this
+// sensor). The loop is branch-free — it only accumulates channel sums and the R*G cross
+// term. All thresholds are applied once, later, in looks_like_bad_green_frame().
+static CameraFrameQuality analyze_rgb565_frame(const uint8_t* data, size_t len, uint32_t width)
+{
+    CameraFrameQuality q;
+    if (data == nullptr || len < 2 || width == 0) {
+        return q;
+    }
+    // frame_.data is little-endian RGB565 here (the YUV422P/RGB565X copy paths byte-swap to LE
+    // to match the RGB565_LE downstream), so read low byte first.
+    q.first = (uint16_t)(data[0] | (data[1] << 8));
+
+    const uint32_t pixels = (uint32_t)(len / 2);
+    const uint32_t height = pixels / width;
+    if (height == 0) {
+        return q;
+    }
+    constexpr uint32_t kStrips = 5;
+    for (uint32_t s = 1; s <= kStrips; s++) {
+        uint32_t y = (uint32_t)((uint64_t)s * height / (kStrips + 1));
+        if (y >= height) y = height - 1;
+        const uint8_t* row = data + (size_t)y * width * 2;
+        for (uint32_t x = 0; x < width; x++) {
+            uint16_t v = (uint16_t)(row[2 * x] | (row[2 * x + 1] << 8));
+            uint32_t r = (v >> 11) & 0x1f;
+            uint32_t g = (v >> 5) & 0x3f;
+            uint32_t b = v & 0x1f;
+            q.sum_r += r;
+            q.sum_g += g;
+            q.sum_b += b;
+            q.sum_rg += (int64_t)r * (int64_t)g;
+            q.n++;
+        }
+    }
+    return q;
+}
+
+static CameraFrameQuality analyze_yuyv_frame(const uint8_t* data, size_t len)
+{
+    CameraFrameQuality q;
+    q.yuv = true;
+    if (data == nullptr || len < 4) {
+        return q;
+    }
+
+    const size_t macropixel_count = len / 4;
+    q.first = static_cast<uint16_t>((data[0] << 8) | data[1]);
+    for (size_t i = 0; i < macropixel_count; i += 4) {
+        const uint8_t* p = data + i * 4;
+        uint16_t signature = static_cast<uint16_t>((p[1] << 8) | p[3]);  // U/V fingerprint
+        if (signature < q.min) q.min = signature;
+        if (signature > q.max) q.max = signature;
+        if (signature != static_cast<uint16_t>((data[1] << 8) | data[3])) q.varied++;
+        if (yuv_pixel_is_green(p[0], p[1], p[3])) q.green_dominant++;
+        if (yuv_pixel_is_green(p[2], p[1], p[3])) q.green_dominant++;
+        q.sampled += 2;
+    }
+    return q;
+}
+
+static CameraFrameQuality analyze_frame_by_format(const uint8_t* data, size_t len, v4l2_pix_fmt_t format,
+                                                  uint32_t width)
+{
+    if (format == V4L2_PIX_FMT_YUYV) {
+        return analyze_yuyv_frame(data, len);
+    }
+    return analyze_rgb565_frame(data, len, width);
+}
+
+static bool looks_like_bad_green_frame(const CameraFrameQuality& q)
+{
+    if (q.yuv) {
+        if (q.sampled == 0) {
+            return true;
+        }
+        return q.green_dominant > (q.sampled * 90 / 100);
+    }
+
+    // RGB565 corruption (the transient "green frame" on this sensor) decorrelates the green
+    // channel from luminance while R and B still track the scene. Detect it by the SIGN of
+    // cov(R,G): scale-invariant, so no divide / sqrt / variance is needed.
+    //   cov(R,G) ∝ C = n*Σ(r*g) − Σr*Σg ;  a normal frame gives C>0, a green-corrupt one C<0.
+    // A near-uniform all-green buffer can still read slightly positive, so also flag extreme
+    // green dominance: Σg*2 > 3*(Σr+Σb) ≈ G/avg(R,B) > 1.5 in raw 5/6-bit units (G is 6-bit,
+    // R/B are 5-bit, so the 2:3 factors normalize the bit depths). A false positive only costs
+    // one bounded retry; passing a corrupt frame downstream is worse.
+    if (q.n == 0) {
+        return true;
+    }
+    int64_t cov = (int64_t)q.n * q.sum_rg - q.sum_r * q.sum_g;
+    bool green_decorrelated = cov < 0;
+    bool extreme_green = (q.sum_g * 2) > (3 * (q.sum_r + q.sum_b));
+    return green_decorrelated || extreme_green;
+}
+
+static void copy_frame_data_by_format(v4l2_pix_fmt_t format, uint8_t* dst, const void* src, size_t len)
+{
+#ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
+    if (format == V4L2_PIX_FMT_RGB565) {
+        auto src16 = static_cast<const uint16_t*>(src);
+        auto dst16 = reinterpret_cast<uint16_t*>(dst);
+        size_t count = len / 2;
+        for (size_t i = 0; i < count; i++) {
+            dst16[i] = __builtin_bswap16(src16[i]);
+        }
+        return;
+    }
+#endif
+    memcpy(dst, src, len);
+}
+
 bool StackChanCamera::EncodeToJpegDataUri(std::string& data_uri, int quality)
 {
     data_uri.clear();
@@ -413,13 +629,7 @@ bool StackChanCamera::EncodeToJpegDataUri(std::string& data_uri, int quality)
     {
         const uint16_t w = frame_.width ? frame_.width : 320;
         const uint16_t h = frame_.height ? frame_.height : 240;
-        // The capture buffer labelled YUYV is actually big-endian RGB565 (the same
-        // discovery that fixed the on-screen preview in Capture()). Tell the JPEG
-        // encoder it's RGB565X (big-endian RGB565) so the photo sent to the vision
-        // model has correct colors, instead of decoding RGB bytes as YUV -- which
-        // gave Grok a magenta/green image ("purple face, green outline").
-        const v4l2_pix_fmt_t enc_fmt =
-            (frame_.format == V4L2_PIX_FMT_YUYV) ? V4L2_PIX_FMT_RGB565X : frame_.format;
+        const v4l2_pix_fmt_t enc_fmt = jpeg_encode_format_for(frame_.format);
         bool ok = image_to_jpeg_cb(
             frame_.data, frame_.len, w, h, enc_fmt, quality,
             [](void* arg, size_t index, const void* data, size_t len) -> size_t {
@@ -467,7 +677,14 @@ bool StackChanCamera::Capture()
     // Play shutter sfx
     hal_bridge::app_play_sound(OGG_CAMERA_SHUTTER);
 
-    for (int i = 0; i < 3; i++) {
+    bool captured_frame = false;
+    constexpr int kWarmupFrames = 2;
+    // This GC0308 module intermittently emits corrupt/green frames; the validator discards them
+    // and retries. Each retry costs ~80-130ms (one frame + a 30ms settle), so 12 validated
+    // attempts (~1-1.5s worst case) stays well under the photo/vision timeouts while making a
+    // run of consecutive bad frames very unlikely to fail the capture.
+    constexpr int kMaxCaptureAttempts = kWarmupFrames + 12;
+    for (int i = 0; i < kMaxCaptureAttempts; i++) {
         struct v4l2_buffer buf = {};
         buf.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory             = V4L2_MEMORY_MMAP;
@@ -475,7 +692,7 @@ bool StackChanCamera::Capture()
             ESP_LOGE(TAG, "VIDIOC_DQBUF failed");
             return false;
         }
-        if (i == 2) {
+        if (i >= kWarmupFrames) {
             // 保存帧副本到PSRAM
             if (frame_.data) {
                 heap_caps_free(frame_.data);
@@ -511,25 +728,23 @@ bool StackChanCamera::Capture()
 #ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
                 case V4L2_PIX_FMT_JPEG:
 #endif  // CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
-#ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
-                {
-                    auto src16   = (uint16_t*)mmap_buffers_[buf.index].start;
-                    auto dst16   = (uint16_t*)frame_.data;
-                    size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
-                    for (size_t i = 0; i < count; i++) {
-                        dst16[i] = __builtin_bswap16(src16[i]);
-                    }
-                }
-#else
-                    memcpy(frame_.data, mmap_buffers_[buf.index].start,
-                           MIN(mmap_buffers_[buf.index].length, frame_.len));
-#endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
+                    copy_frame_data_by_format(sensor_format_, frame_.data, mmap_buffers_[buf.index].start,
+                                              MIN(mmap_buffers_[buf.index].length, frame_.len));
                     frame_.format = sensor_format_;
                     break;
                 case V4L2_PIX_FMT_YUV422P: {
-                    frame_.format = V4L2_PIX_FMT_YUYV;
-                    memcpy(frame_.data, mmap_buffers_[buf.index].start,
-                           MIN(mmap_buffers_[buf.index].length, frame_.len));
+                    // This GC0308 module reports YUV422P but actually streams big-endian RGB565:
+                    // the raw buffer only decodes correctly as RGB565-BE, and the sensor's nominal
+                    // "RGB565" mode (reg 0x24=0xa6) produces corrupt frames while this "YUV422" mode
+                    // (0xa2) yields clean RGB565. Treat it exactly like RGB565X — byte-swap BE->LE so
+                    // the RGB565_LE downstream paths (preview/rotate/JPEG) get correct colors.
+                    auto src16         = (uint16_t*)mmap_buffers_[buf.index].start;
+                    auto dst16         = (uint16_t*)frame_.data;
+                    size_t pixel_count = (size_t)frame_.width * (size_t)frame_.height;
+                    for (size_t i = 0; i < pixel_count; i++) {
+                        dst16[i] = __builtin_bswap16(src16[i]);
+                    }
+                    frame_.format = V4L2_PIX_FMT_RGB565;
                     break;
                 }
                 case V4L2_PIX_FMT_RGB565X: {
@@ -552,33 +767,37 @@ bool StackChanCamera::Capture()
                     return false;
             }
 
-            // [TEMP DIAG] Fingerprint the captured frame to classify the "all green"
-            // instability: a UNIFORM buffer (min==max / varied~=0) means the frame was
-            // not really written (sensor/DMA/AE/memory-contention -> transient), while a
-            // VARIED buffer that still looks green points at the decode/preview path.
-            // px0 shows the actual pixel value (pure green RGB565 = 0x07e0). Also logs
-            // free memory to spot OOM/bandwidth pressure at capture time. Remove after
-            // the green-frame issue is diagnosed.
+            // [TEMP DIAG] Fingerprint the captured frame using frame_.format so all
+            // downstream paths agree on the same FourCC interpretation. Also logs free
+            // memory to spot OOM/bandwidth pressure at capture time.
             {
-                const uint16_t* diag_px = reinterpret_cast<const uint16_t*>(frame_.data);
-                size_t diag_count       = frame_.len / 2;
-                uint16_t diag_first     = diag_count ? diag_px[0] : 0;
-                uint16_t diag_min = 0xFFFF, diag_max = 0x0000;
-                uint32_t diag_varied = 0, diag_sampled = 0;
-                for (size_t i = 0; i < diag_count; i += 8) {
-                    uint16_t v = diag_px[i];
-                    if (v < diag_min) diag_min = v;
-                    if (v > diag_max) diag_max = v;
-                    if (v != diag_first) diag_varied++;
-                    diag_sampled++;
-                }
+                auto diag = analyze_frame_by_format(frame_.data, frame_.len, frame_.format, frame_.width);
+                int64_t diag_cov = diag.n ? ((int64_t)diag.n * diag.sum_rg - diag.sum_r * diag.sum_g) : 0;
                 ESP_LOGI(TAG,
-                         "[DIAG] frame %dx%d fmt=0x%08lx len=%u px0=0x%04x min=0x%04x max=0x%04x varied=%lu/%lu "
-                         "free_psram=%u free_int=%u",
+                         "[DIAG] frame %dx%d fmt=0x%08lx len=%u first=0x%04x n=%lu sumR=%lld sumG=%lld sumB=%lld "
+                         "cov=%lld free_psram=%u free_int=%u",
                          (int)frame_.width, (int)frame_.height, (unsigned long)frame_.format, (unsigned)frame_.len,
-                         diag_first, diag_min, diag_max, (unsigned long)diag_varied, (unsigned long)diag_sampled,
+                         diag.first, (unsigned long)diag.n, (long long)diag.sum_r, (long long)diag.sum_g,
+                         (long long)diag.sum_b, (long long)diag_cov,
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                if (looks_like_bad_green_frame(diag)) {
+                    bool can_retry = i + 1 < kMaxCaptureAttempts;
+                    ESP_LOGW(TAG, "discard suspicious green/uniform camera frame%s %d/%d",
+                             can_retry ? ", retry" : "", i - kWarmupFrames + 1,
+                             kMaxCaptureAttempts - kWarmupFrames);
+                    heap_caps_free(frame_.data);
+                    frame_.data = nullptr;
+                    frame_.len = 0;
+                    frame_.format = 0;
+                    if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                        ESP_LOGE(TAG, "Retry cleanup: VIDIOC_QBUF failed");
+                    }
+                    if (can_retry) {
+                        vTaskDelay(pdMS_TO_TICKS(30));
+                    }
+                    continue;
+                }
             }
 
 #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
@@ -607,7 +826,7 @@ bool StackChanCamera::Capture()
                     rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
                     break;
                 case V4L2_PIX_FMT_YUYV:
-                    rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
+                    rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_YUYV;
                     break;
                 case V4L2_PIX_FMT_GREY:
                     rotate_cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_Y;
@@ -812,11 +1031,20 @@ bool StackChanCamera::Capture()
             rotate_src = nullptr;
 #endif  // CONFIG_SOC_PPA_SUPPORTED
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+            captured_frame = true;
         }
 
         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF failed");
         }
+        if (captured_frame) {
+            break;
+        }
+    }
+
+    if (!captured_frame) {
+        ESP_LOGE(TAG, "failed to capture a valid camera frame after retries");
+        return false;
     }
 
     // 显示预览图片
@@ -840,38 +1068,47 @@ bool StackChanCamera::Capture()
         switch (frame_.format) {
             // LVGL 显示 YUV 系的图像似乎都有问题，暂时转换为 RGB565 显示
             case V4L2_PIX_FMT_YUYV: {
-                // The GC0308/esp_video buffer is actually RGB565 (big-endian, 2 bytes/pixel) even though
-                // it is labelled YUV422. Reinterpret as RGB565; if the frame is larger than the 320x240
-                // display (e.g. 640x480), nearest-neighbour downscale 2:1 so it fits.
-                const uint16_t scale = (w > 320) ? 2 : 1;
-                const uint16_t wo    = w / scale;
-                const uint16_t ho    = h / scale;
-                color_format         = LV_COLOR_FORMAT_RGB565;
-                data = (uint8_t*)heap_caps_malloc((size_t)wo * ho * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                color_format = LV_COLOR_FORMAT_RGB565;
+                data = (uint8_t*)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (data == nullptr) {
                     ESP_LOGE(TAG, "Failed to allocate memory for preview image");
                     return false;
                 }
-                const uint8_t* src       = frame_.data;
-                const size_t   in_stride = (size_t)w * 2;  // 2 bytes/pixel
-                uint16_t*      dst       = (uint16_t*)data;
-                for (uint16_t oy = 0; oy < ho; oy++) {
-                    const uint8_t* row = src + (size_t)(oy * scale) * in_stride;
-                    for (uint16_t ox = 0; ox < wo; ox++) {
-                        const uint8_t* p = row + (size_t)(ox * scale) * 2;  // RGB565-BE pixel
-                        dst[(size_t)oy * wo + ox] = (uint16_t)((p[0] << 8) | p[1]);
-                    }
+                esp_imgfx_color_convert_cfg_t convert_cfg = {
+                    .in_res = {.width = static_cast<int16_t>(frame_.width),
+                               .height = static_cast<int16_t>(frame_.height)},
+                    .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_YUYV,
+                    .out_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE,
+                    .color_space_std = ESP_IMGFX_COLOR_SPACE_STD_BT601,
+                };
+                esp_imgfx_color_convert_handle_t convert_handle = nullptr;
+                esp_imgfx_err_t err = esp_imgfx_color_convert_open(&convert_cfg, &convert_handle);
+                if (err != ESP_IMGFX_ERR_OK || convert_handle == nullptr) {
+                    ESP_LOGE(TAG, "esp_imgfx_color_convert_open failed");
+                    heap_caps_free(data);
+                    data = nullptr;
+                    return false;
                 }
-                w               = wo;
-                h               = ho;
-                stride          = (size_t)wo * 2;
-                lvgl_image_size = (size_t)wo * ho * 2;
-                {
-                    const size_t ci = ((size_t)ho / 2) * wo + wo / 2;
-                    const uint16_t cv = dst[ci];
-                    ESP_LOGD(TAG, "preview RGB565 %ux%u center 0x%04x (R=%d G=%d B=%d)", (unsigned)wo,
-                             (unsigned)ho, cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
+                esp_imgfx_data_t convert_input_data = {
+                    .data = frame_.data,
+                    .data_len = frame_.len,
+                };
+                esp_imgfx_data_t convert_output_data = {
+                    .data = data,
+                    .data_len = static_cast<uint32_t>((size_t)w * h * 2),
+                };
+                err = esp_imgfx_color_convert_process(convert_handle, &convert_input_data, &convert_output_data);
+                if (err != ESP_IMGFX_ERR_OK) {
+                    ESP_LOGE(TAG, "esp_imgfx_color_convert_process failed");
+                    heap_caps_free(data);
+                    data = nullptr;
+                    esp_imgfx_color_convert_close(convert_handle);
+                    convert_handle = nullptr;
+                    return false;
                 }
+                esp_imgfx_color_convert_close(convert_handle);
+                convert_handle = nullptr;
+                lvgl_image_size = (size_t)w * h * 2;
                 break;
             }
 
@@ -881,21 +1118,8 @@ bool StackChanCamera::Capture()
                     ESP_LOGE(TAG, "Failed to allocate memory for preview image");
                     return false;
                 }
-                // Repack as big-endian RGB565 (raw byte0<<8 | byte1): verified red `c1 a5`->0xc1a5 (red),
-                // green `16 a2`->0x16a2 (green). Matches the display's expected RGB565 word order.
-                const uint8_t* rsrc = frame_.data;
-                uint16_t*      rdst = (uint16_t*)data;
-                const size_t   npx  = (size_t)w * h;
-                for (size_t i = 0; i < npx; i++) {
-                    rdst[i] = (uint16_t)((rsrc[i * 2] << 8) | rsrc[i * 2 + 1]);
-                }
+                memcpy(data, frame_.data, MIN(frame_.len, (size_t)w * h * 2));
                 lvgl_image_size = (size_t)w * h * 2;
-                {
-                    const size_t ci = ((size_t)h / 2) * (size_t)w + (size_t)w / 2;
-                    const uint16_t cv = rdst[ci];
-                    ESP_LOGD(TAG, "preview RGB565 center: raw=%02x %02x -> 0x%04x (R=%d G=%d B=%d)",
-                             rsrc[ci * 2], rsrc[ci * 2 + 1], cv, (cv >> 11) & 0x1f, (cv >> 5) & 0x3f, cv & 0x1f);
-                }
                 break;
             }
 
@@ -934,6 +1158,46 @@ bool StackChanCamera::Capture()
         auto image = std::make_unique<LvglAllocatedImage>(data, lvgl_image_size, w, h, stride, color_format);
         display->SetPreviewImage(std::move(image));
     }
+    return true;
+}
+
+bool StackChanCamera::DumpRawCaptureToLog()
+{
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
+    }
+
+    if (!streaming_on_ || video_fd_ < 0) {
+        ESP_LOGE(TAG, "camera stream is not ready for raw dump");
+        return false;
+    }
+
+    constexpr int kWarmupFrames = 2;
+    for (int i = 0; i <= kWarmupFrames; i++) {
+        struct v4l2_buffer buf = {};
+        buf.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory             = V4L2_MEMORY_MMAP;
+        if (ioctl(video_fd_, VIDIOC_DQBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "raw dump VIDIOC_DQBUF failed");
+            return false;
+        }
+
+        bool ok = true;
+        if (i == kWarmupFrames) {
+            const size_t len = MIN((size_t)buf.bytesused, mmap_buffers_[buf.index].length);
+            ok = log_base64_camera_raw(static_cast<const uint8_t*>(mmap_buffers_[buf.index].start), len, frame_.width,
+                                       frame_.height, sensor_format_, 768);
+        }
+
+        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "raw dump VIDIOC_QBUF failed");
+            return false;
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -991,25 +1255,23 @@ bool StackChanCamera::StreamCaptures()
 #ifdef CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
                 case V4L2_PIX_FMT_JPEG:
 #endif  // CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT
-#ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
-                {
-                    auto src16   = (uint16_t*)mmap_buffers_[buf.index].start;
-                    auto dst16   = (uint16_t*)frame_.data;
-                    size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
-                    for (size_t i = 0; i < count; i++) {
-                        dst16[i] = __builtin_bswap16(src16[i]);
-                    }
-                }
-#else
-                    memcpy(frame_.data, mmap_buffers_[buf.index].start,
-                           MIN(mmap_buffers_[buf.index].length, frame_.len));
-#endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP
+                    copy_frame_data_by_format(sensor_format_, frame_.data, mmap_buffers_[buf.index].start,
+                                              MIN(mmap_buffers_[buf.index].length, frame_.len));
                     frame_.format = sensor_format_;
                     break;
                 case V4L2_PIX_FMT_YUV422P: {
-                    frame_.format = V4L2_PIX_FMT_YUYV;
-                    memcpy(frame_.data, mmap_buffers_[buf.index].start,
-                           MIN(mmap_buffers_[buf.index].length, frame_.len));
+                    // This GC0308 module reports YUV422P but actually streams big-endian RGB565:
+                    // the raw buffer only decodes correctly as RGB565-BE, and the sensor's nominal
+                    // "RGB565" mode (reg 0x24=0xa6) produces corrupt frames while this "YUV422" mode
+                    // (0xa2) yields clean RGB565. Treat it exactly like RGB565X — byte-swap BE->LE so
+                    // the RGB565_LE downstream paths (preview/rotate/JPEG) get correct colors.
+                    auto src16         = (uint16_t*)mmap_buffers_[buf.index].start;
+                    auto dst16         = (uint16_t*)frame_.data;
+                    size_t pixel_count = (size_t)frame_.width * (size_t)frame_.height;
+                    for (size_t i = 0; i < pixel_count; i++) {
+                        dst16[i] = __builtin_bswap16(src16[i]);
+                    }
+                    frame_.format = V4L2_PIX_FMT_RGB565;
                     break;
                 }
                 case V4L2_PIX_FMT_RGB565X: {
@@ -1127,9 +1389,7 @@ std::string StackChanCamera::Explain(const std::string& question)
     encoder_thread_ = std::thread([this, jpeg_queue]() {
         uint16_t w             = frame_.width ? frame_.width : 320;
         uint16_t h             = frame_.height ? frame_.height : 240;
-        // YUYV-labelled buffer is actually big-endian RGB565; encode as RGB565X so
-        // colors are correct (see EncodeToJpegDataUri for the full explanation).
-        v4l2_pix_fmt_t enc_fmt = (frame_.format == V4L2_PIX_FMT_YUYV) ? V4L2_PIX_FMT_RGB565X : frame_.format;
+        v4l2_pix_fmt_t enc_fmt = jpeg_encode_format_for(frame_.format);
         bool ok                = image_to_jpeg_cb(
                            frame_.data, frame_.len, w, h, enc_fmt, 80,
                            [](void* arg, size_t index, const void* data, size_t len) -> size_t {

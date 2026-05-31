@@ -51,6 +51,7 @@ public:
     virtual void SetExplainUrl(const std::string& url, const std::string& token);
     virtual bool Capture() override;
     virtual bool EncodeToJpegDataUri(std::string& data_uri, int quality = 80) override;
+    bool DumpRawCaptureToLog();
     bool StreamCaptures();
 
     // 翻转控制函数
